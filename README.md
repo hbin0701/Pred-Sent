@@ -1,11 +1,11 @@
-# Step‑by‑Step Prediction (Pred‑Sent)
+# Let's Predict Sentence by Sentence
 
 > ⚠️ **Work in Progress**  —  The codebase is under active development. Will be updated soon.
 
-This repository contains the *official* implementation of the paper **“Let’s Predict Step by Step."**
+This repository contains the *official* implementation of the paper **“Let’s Predict Sentence by Sentence."**
 
-**TL;DR: We present a framework that adapts a pre-
-trained token-level LM to operate in sentence space, by autoregressively predicting.**
+📝 **TL;DR**: We present a framework that **adapts** a pre-trained token-level LM to operate in sentence space, by autoregressively predicting
+continuous embeddings of next sentences.
 
 ## Directory Structure
 
