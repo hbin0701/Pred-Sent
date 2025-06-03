@@ -114,10 +114,6 @@ def gsm8k_test(model, data_path, start=0, end=MAX_INT, batch_size=1, tensor_para
     print(args.result_file, "Final Acc:", final_acc)
 
 
-    with open("results.txt", "a") as f:
-        f.write(args.result_file + "\t" + str(round(final_acc, 4)))
-
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str)  # model path
@@ -134,13 +130,10 @@ def parse_args():
 if __name__ == "__main__":
     # Login First.
     # login(token="your_huggingface_token")
-
     args = parse_args()
     MODEL = args.model
     DATA = args.data_file
     
-    BATCH_SIZE = 1000000000
-    TEMP = 0
     args = parse_args()
-    gsm8k_test(model=MODEL, data_path=DATA, start=0, end=1000000000, batch_size=BATCH_SIZE, temp=TEMP)
+    gsm8k_test(model=MODEL, data_path=DATA, start=0, end=1000000000, batch_size=args.batch_size, temp=args.temp)
     

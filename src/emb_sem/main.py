@@ -35,6 +35,8 @@ def main():
     parser.add_argument("--proj_name", type=str, default="My_project")
     parser.add_argument("--exp_name", type=str, default="My_experiment")
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
+    parser.add_argument("--wandb_key", type=str, default=None, help="WandB API key")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="WandB entity name")
 
     parser.add_argument("--share_param", type=bool, default=False) # whether for encoder and decoder to share parameters.
 
@@ -44,8 +46,14 @@ def main():
     device = accelerator.device
 
     if accelerator.is_main_process:
-        wandb.login(key="PUT_YOUR_KEY_HERE")
-        wandb.init(project=args.proj_name, entity="hbin0701", name=args.exp_name, config=vars(args))
+        if args.wandb_key:
+            wandb.login(key=args.wandb_key)
+            wandb.init(
+                project=args.proj_name, 
+                entity=args.wandb_entity, 
+                name=args.exp_name, 
+                config=vars(args)
+            )
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_model_name)
     if tokenizer.pad_token is None:

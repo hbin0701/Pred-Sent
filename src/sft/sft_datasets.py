@@ -43,8 +43,9 @@ def get_examples(data_dir, split, mode):
             new_elem["question"] = ''
         
         # Enable this for NO-SFT Setting.
-        # elem['steps'] = [elem['steps'][-1]]
-        #         
+        if mode == "no_cot":
+            elem['steps'] = [elem['steps'][-1]]
+                
         if data_dir != 'fineweb-edu' or "###" in elem['steps'][-1] or "<answer>" in elem['steps'][-1]:
             new_elem["answer"] = "\n".join(elem["steps"])      
         else:
@@ -81,7 +82,7 @@ class FineTuningGeneratorDataset(torch.utils.data.Dataset):
     def __init__(
         self, 
         tokenizer: transformers.PreTrainedTokenizer = None, 
-        mode: str="ft",
+        mode: str="cot",
         data_dir: str = 'data/gsm8k', 
         target_set: str = 'train',
         loss_on_prefix=False,

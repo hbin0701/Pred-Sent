@@ -1,13 +1,13 @@
 export WANDB_API_KEY="WANDB_API_KEY" # put your wandb key here
 export WANDB_PROJECT="WANDB_PROJECT" # put your project name here
 export WANDB_ENTITY="WANDB_ENTITY" # put your wandb id here.
-
+export WANDB_NAME="WANDB_EXP_NAME"   
 
 model_name_or_path="SFT_MODEL_PATH"
 save_dir="SAVE_DIR"
-export WANDB_NAME="WANDB_NAME"   
 
 data_dir="DATA_DIR"
+USE_COT=true
 # lr: 1e-6 for Mistral and 1e-5 for Others.
 
 accelerate launch \
@@ -33,4 +33,5 @@ accelerate launch \
   --logging_dir ./wandb \
   --logging_steps 8 \
   --seed 42 \
-  --save_model_only True
+  --save_model_only True \
+  --mode ${USE_COT}

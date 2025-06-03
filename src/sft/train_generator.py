@@ -15,6 +15,7 @@ from utils.optim import get_optimizers
 from utils.models import build_model, save_llm_checkpoint, save_llm, save_training_args_with_accelerator
 from utils.datasets import make_training_dataloaders
 
+from sft_datasets import make_finetuning_generator_data_module
 
 @dataclass
 class ModelArguments:
@@ -25,7 +26,7 @@ class DataArguments:
     dataset: str = field(default='gsm8k')
     data_dir: str = field(default='data/gsm8k/', metadata={"help": "Path to the training data."})
     target_set: str = field(default='train')
-    mode: str = field(default="ft", metadata={"help": "ft or rft"})
+    mode: str = field(default="cot", metadata={"help": "cot or no_cot"})
     loss_on_prefix: bool = field(default=True, metadata={"help": "Whether to compute loss on the prefix"})
 
 @dataclass
@@ -95,7 +96,6 @@ def main():
     # print("TORCH VERSION", torch.__version__)
     # print("TORCH NCCL VERSION", torch.cuda.nccl.version())
     
-    from sft_datasets import make_finetuning_generator_data_module
 
     accelerator = Accelerator(gradient_accumulation_steps=training_args.gradient_accumulation_steps)
 

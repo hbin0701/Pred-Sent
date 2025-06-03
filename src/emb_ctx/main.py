@@ -98,6 +98,8 @@ def main():
     parser.add_argument("--proj_name", type=str, default="My_project", help="Project name for wandb")
     parser.add_argument("--exp_name", type=str, default="Context_Step_Prediction", help="Experiment name for wandb")
     parser.add_argument("--save_dir", type=str, default="./checkpoints_stage1.6", help="Directory to save checkpoints")
+    parser.add_argument("--wandb_key", type=str, default=None, help="WandB API key")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="WandB entity name")
 
     # Loss function parameters
     parser.add_argument('--use_dist', action='store_true', help='Whether to use distance loss')
@@ -131,8 +133,14 @@ def main():
     device = accelerator1.device  # Use device from first accelerator for consistency
     
     if accelerator1.is_main_process:
-        wandb.login(key="PUT_YOUR_KEY_HERE")
-        wandb.init(project=args.proj_name, entity="hbin0701", name=args.exp_name, config=vars(args))
+        if args.wandb_key:
+            wandb.login(key=args.wandb_key)
+            wandb.init(
+                project=args.proj_name, 
+                entity=args.wandb_entity, 
+                name=args.exp_name, 
+                config=vars(args)
+            )
 
     # Set up tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_model_name)
