@@ -178,10 +178,9 @@ def main():
 
     accelerator.wait_for_everyone()
     
-    save_llm_checkpoint(accelerator, model, tokenizer, output_args.save_dir)
+    save_llm_checkpoint(accelerator, model, tokenizer, output_args.save_dir, global_step, training_args.save_total_limit)
     save_training_args_with_accelerator(accelerator, training_args, output_args.save_dir)
     accelerator.save_state(os.path.join(output_args.save_dir, 'resume'))
-    
 
     if accelerator.is_main_process:
         wandb.finish()

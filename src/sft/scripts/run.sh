@@ -3,12 +3,11 @@ export WANDB_PROJECT="WANDB_PROJECT" # put your project name here
 export WANDB_ENTITY="WANDB_ENTITY" # put your wandb id here.
 export WANDB_NAME="WANDB_EXP_NAME"   
 
-model_name_or_path="SFT_MODEL_PATH"
+model_name_or_path="gpt2"
 save_dir="SAVE_DIR"
 
 data_dir="DATA_DIR"
-USE_COT=true
-# lr: 1e-6 for Mistral and 1e-5 for Others.
+MODE="no_cot" # no_cot or cot
 
 accelerate launch \
   --config_file ./config.yaml \
@@ -34,4 +33,4 @@ accelerate launch \
   --logging_steps 8 \
   --seed 42 \
   --save_model_only True \
-  --mode ${USE_COT}
+  --mode ${MODE}
