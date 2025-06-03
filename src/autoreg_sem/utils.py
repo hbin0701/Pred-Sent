@@ -4,33 +4,6 @@ import numpy as np
 import torch
 from colorama import Fore, Style, init
 
-# def pprint(log_dict):
-#     # Initialize colorama (automatically resets colors after each print)
-#     init(autoreset=True)
-    
-#     # Iterate through the dictionary sorted by key for consistent ordering.
-#     for key, value in sorted(log_dict.items()):
-#         # Split keys on "/" to highlight different levels
-#         parts = key.split('/')
-#         colored_parts = []
-#         for idx, part in enumerate(parts):
-#             # First level: bright blue (e.g., "train_acc" or "val_acc")
-#             if idx == 0:
-#                 colored_parts.append(Fore.BLUE + Style.BRIGHT + part + Style.RESET_ALL)
-#             # Last level: green for final detail (e.g., "overall", "pos", etc.)
-#             elif idx == len(parts) - 1:
-#                 colored_parts.append(Fore.GREEN + part + Style.RESET_ALL)
-#             # Intermediate levels: cyan
-#             else:
-#                 colored_parts.append(Fore.CYAN + part + Style.RESET_ALL)
-#         # Join the colored parts with a separator
-#         colored_key = " / ".join(colored_parts)
-#         # Color the value (here using magenta)
-#         colored_value = Fore.MAGENTA + str(round(value, 4)) + Style.RESET_ALL
-#         print(f"{colored_key}: {colored_value}")
-    
-#     print()
-
 def pprint(log_dict):
     # Iterate through the dictionary sorted by key for consistent ordering.
     for key, value in sorted(log_dict.items()):

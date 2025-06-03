@@ -12,8 +12,14 @@ import time
 def train(args, model, dataset_train, eval_dataloader, test_dataloader, optimizer, lr_scheduler, device, num_epochs=3, accelerator=None, save_dir="./checkpoints/stage2"):
     model.train()
     if accelerator.is_main_process:
-        wandb.login(key="PUT_YOUR_KEY_HERE")
-        wandb.init(project=args.proj_name, entity="hbin0701", name=args.exp_name, config=vars(args))
+        if args.wandb_key:
+            wandb.login(key=args.wandb_key)
+            wandb.init(
+                project=args.proj_name, 
+                entity=args.wandb_entity, 
+                name=args.exp_name, 
+                config=vars(args)
+            )
         
     os.makedirs(save_dir, exist_ok=True)
     step = 0
@@ -37,10 +43,6 @@ def train(args, model, dataset_train, eval_dataloader, test_dataloader, optimize
             total_loss = loss_dict["total_loss"]
             ce_loss = loss_dict["ce_loss"]
             cont_loss = loss_dict["cont_loss"]
-            distance_loss = loss_dict["distance_loss"]
-            distance_loss1 = loss_dict["distance_loss1"]
-            distance_loss2 = loss_dict["distance_loss2"]
-            mse_loss = loss_dict["mse_loss"]
 
             accelerator.backward(total_loss)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -58,11 +60,7 @@ def train(args, model, dataset_train, eval_dataloader, test_dataloader, optimize
                 wandb.log({
                     "train/step_loss": total_loss.item(), 
                     "train/ce_loss": ce_loss.item(), 
-                    "train/cont_loss": cont_loss.item(),
-                    "train/distance_loss": distance_loss.item(),
-                    "train/distance_loss1": distance_loss1.item(),
-                    "train/distance_loss2": distance_loss2.item(),
-                    "train/mse_loss": mse_loss.item()
+                    "train/cont_loss": cont_loss.item()
                 })
 
         avg_loss = total_loss_val / len(train_dataloader)
@@ -76,7 +74,7 @@ def train(args, model, dataset_train, eval_dataloader, test_dataloader, optimize
                 "train/epoch_cont_loss": avg_cont
             })
 
-        if (epoch + 1) % 1 == 0:
+        if (epoch + 1) % 10 == 0:
             if accelerator.is_main_process:
                 # Save
                 save_path = os.path.join(save_dir, f"epoch_{epoch+1}")
@@ -283,10 +281,6 @@ def evaluate(model, eval_dataloader, device, accelerator):
     total_eval_loss = 0.0
     total_eval_ce_loss = 0.0
     total_eval_cont_loss = 0.0
-    total_eval_distance_loss = 0.0
-    total_eval_distance_loss1 = 0.0
-    total_eval_distance_loss2 = 0.0
-    total_eval_mse_loss = 0.0
     n_batches = 0
     
     print("evaluating ... ")
@@ -303,19 +297,11 @@ def evaluate(model, eval_dataloader, device, accelerator):
             total_eval_loss += loss_dict["total_loss"].item()
             total_eval_ce_loss += loss_dict["ce_loss"].item()
             total_eval_cont_loss += loss_dict["cont_loss"].item()
-            total_eval_distance_loss += loss_dict["distance_loss"].item()
-            total_eval_distance_loss1 += loss_dict["distance_loss1"].item()
-            total_eval_distance_loss2 += loss_dict["distance_loss2"].item()
-            total_eval_mse_loss += loss_dict["mse_loss"].item()
             n_batches += 1
 
     avg_total_loss = total_eval_loss / n_batches
     avg_ce_loss = total_eval_ce_loss / n_batches
     avg_cont_loss = total_eval_cont_loss / n_batches
-    avg_distance_loss = total_eval_distance_loss / n_batches
-    avg_distance_loss1 = total_eval_distance_loss1 / n_batches
-    avg_distance_loss2 = total_eval_distance_loss2 / n_batches
-    avg_mse_loss = total_eval_mse_loss / n_batches
 
     model.train()
 
@@ -323,19 +309,11 @@ def evaluate(model, eval_dataloader, device, accelerator):
         wandb.log({
             "eval/total_loss": avg_total_loss,
             "eval/ce_loss": avg_ce_loss,
-            "eval/cont_loss": avg_cont_loss,
-            "eval/distance_loss": avg_distance_loss,
-            "eval/distance_loss1": avg_distance_loss1,
-            "eval/distance_loss2": avg_distance_loss2,
-            "eval/mse_loss": avg_mse_loss
+            "eval/cont_loss": avg_cont_loss
         })
 
     return {
         "total_loss": avg_total_loss,
         "ce_loss": avg_ce_loss,
-        "cont_loss": avg_cont_loss,
-        "distance_loss": avg_distance_loss,
-        "distance_loss1": avg_distance_loss1,
-        "distance_loss2": avg_distance_loss2,
-        "mse_loss": avg_mse_loss
+        "cont_loss": avg_cont_loss
     }

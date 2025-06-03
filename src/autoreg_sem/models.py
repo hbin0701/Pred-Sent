@@ -12,57 +12,46 @@ import pickle
 from peft import PeftModel, LoraConfig, get_peft_model
 
 class AutoEncoderModel(nn.Module):
-    def __init__(self, tokenizer, encoder_path, decoder_path, translator_path, task, freeze, share_param, use_cont, use_dist=False, use_mse=False):
+    def __init__(self, tokenizer, encoder_path, latent_model_path, decoder_path, task, freeze, share_param, use_cont):
         """
-        Loads the encoder, decoder, and translator models.
+        Loads the encoder, latent model, and decoder models.
         Initializes the tokenizer from a fixed checkpoint.
-        Encoder and Translator can be optionally frozen based on freeze arg.
-        Adds projection layers between encoder-decoder and decoder-translator.
+        Encoder and decoder can be optionally frozen based on freeze arg.
+        Adds projection layers between encoder-latent_model and latent_model-decoder.
         """
         super().__init__()
         self.task = task
         self.dropout_rate = 0.2 # TODO: Make this configurable
 
         self.encoder = AutoModelForCausalLM.from_pretrained(encoder_path)
-        self.decoder = AutoModelForCausalLM.from_pretrained(decoder_path)
-
-        # if 'large' in decoder_path.lower():
-        #     print("Loading PeftModel for Decoder...")
-        #     decoder_lora_config = LoraConfig(
-        #             r=256,
-        #             lora_alpha=1024,
-        #             lora_dropout=0.1,
-        #             bias="none",
-        #             task_type="CAUSAL_LM"
-        #         )
-        #     self.decoder = get_peft_model(self.decoder, decoder_lora_config)
+        self.latent_model = AutoModelForCausalLM.from_pretrained(latent_model_path)
 
         if share_param:
-            # Note: If shared, the translator will also follow the freeze setting below.
-            self.translator = self.encoder
+            # Note: If shared, the decoder will also follow the freeze setting below.
+            self.decoder = self.encoder
         else:
-            if "large" in translator_path.lower():
-                print("Loading PeftModel for Translator...")
-                self.translator = PeftModel.from_pretrained(
-                    self.decoder,               # or self.encoder, whichever backbone
-                    translator_path,            # dir with adapter_config.json + .safetensors
+            if "large" in decoder_path.lower():
+                print("Loading PeftModel for Decoder...")
+                self.decoder = PeftModel.from_pretrained(
+                    self.latent_model,               # or self.encoder, whichever backbone
+                    decoder_path,            # dir with adapter_config.json + .safetensors
                 )
             else:
-                self.translator = AutoModelForCausalLM.from_pretrained(
-                    translator_path,
+                self.decoder = AutoModelForCausalLM.from_pretrained(
+                    decoder_path,
                 )
 
-        # Freeze encoder & translator parameters only if freeze is True.
+        # Freeze encoder & decoder parameters only if freeze is True.
         if freeze:
             for param in self.encoder.parameters():
                 param.requires_grad = False
-            for param in self.translator.parameters():
+            for param in self.decoder.parameters():
                 param.requires_grad = False
         else:
             # If not freezing, ensure they are trainable
             for param in self.encoder.parameters():
                 param.requires_grad = True
-            for param in self.translator.parameters():
+            for param in self.decoder.parameters():
                 param.requires_grad = True
 
         # Initialize the common tokenizer.
@@ -75,22 +64,20 @@ class AutoEncoderModel(nn.Module):
 
         # Set pad token IDs.
         self.encoder.config.pad_token_id = self.tokenizer.eos_token_id
+        self.latent_model.config.pad_token_id = self.tokenizer.eos_token_id
         self.decoder.config.pad_token_id = self.tokenizer.eos_token_id
-        self.translator.config.pad_token_id = self.tokenizer.eos_token_id
 
         # Define projection layers
-        hidden_size = self.encoder.config.hidden_size # Assuming encoder, decoder, translator have same hidden size
-        
         hidden_size1 = self.encoder.config.hidden_size
-        hidden_size2 = self.decoder.config.hidden_size
-        hidden_size3 = self.translator.config.hidden_size
+        hidden_size2 = self.latent_model.config.hidden_size
+        hidden_size3 = self.decoder.config.hidden_size
 
-        self.encoder_to_decoder_proj = nn.Sequential(
+        self.encoder_to_latent_model_proj = nn.Sequential(
             nn.Linear(hidden_size1, (hidden_size1 + hidden_size2) // 2),
             nn.GELU(),
             nn.Linear((hidden_size1 + hidden_size2) // 2, hidden_size2)
         )
-        self.decoder_to_translator_proj = nn.Sequential(
+        self.latent_model_to_decoder_proj = nn.Sequential(
             nn.Linear(hidden_size2, (hidden_size2 + hidden_size3) // 2),
             nn.GELU(),
             nn.Linear((hidden_size2 + hidden_size3) // 2, hidden_size3)
@@ -98,14 +85,12 @@ class AutoEncoderModel(nn.Module):
 
         # Move models and projections to bfloat16.
         self.encoder.to(torch.bfloat16)
+        self.latent_model.to(torch.bfloat16)
         self.decoder.to(torch.bfloat16)
-        self.translator.to(torch.bfloat16)
-        self.encoder_to_decoder_proj.to(torch.bfloat16)
-        self.decoder_to_translator_proj.to(torch.bfloat16)
+        self.encoder_to_latent_model_proj.to(torch.bfloat16)
+        self.latent_model_to_decoder_proj.to(torch.bfloat16)
 
         self.use_cont = use_cont
-        self.use_dist = use_dist
-        self.use_mse = use_mse
         
         # Store configuration for saving/loading
         self.config = {
@@ -113,8 +98,6 @@ class AutoEncoderModel(nn.Module):
             "freeze": freeze,
             "share_param": share_param,
             "use_cont": use_cont,
-            "use_dist": use_dist,
-            "use_mse": use_mse,
             "dropout_rate": self.dropout_rate
         }
 
@@ -141,7 +124,7 @@ class AutoEncoderModel(nn.Module):
             enc_ids = batch_encoder_input_ids[i]
             newline_positions = (enc_ids == self.newline_token_id).nonzero(as_tuple=False)
             first_newline = newline_positions[0].item() if newline_positions.numel() > 0 else enc_ids.size(0) - 1
-            question_embeds = self.decoder.get_input_embeddings()(enc_ids[:first_newline+1])
+            question_embeds = self.latent_model.get_input_embeddings()(enc_ids[:first_newline+1])
             num_valid_steps = int(steps_valid_mask[i].sum().item())
             
             if num_valid_steps > 0:
@@ -207,33 +190,9 @@ class AutoEncoderModel(nn.Module):
         
     def calculate_distance_loss(self, embeddings):
         """
-        Calculate distance loss to encourage maximum distance between embeddings.
-        
-        Args:
-            embeddings: Tensor of shape [batch_size, hidden_size]
-            
-        Returns:
-            distance_loss: Scalar tensor representing the distance loss
+        This function is no longer used and can be removed
         """
-        eps = 1e-8
-        # Use F.normalize for normalization
-        normalized_embeddings = F.normalize(embeddings, p=2, dim=1, eps=eps)
-        
-        # Compute cosine similarity matrix
-        similarity_matrix = torch.mm(normalized_embeddings, normalized_embeddings.t())
-        
-        # Clamp similarity values to avoid numerical issues
-        similarity_matrix = torch.clamp(similarity_matrix, min=-1.0 + eps, max=1.0 - eps)
-        
-        # Remove diagonal (self-similarity)
-        mask = ~torch.eye(similarity_matrix.shape[0], dtype=bool, device=similarity_matrix.device)
-        
-        # Convert to positive distance (1 - abs(similarity))
-        # This creates a loss that pushes all embeddings apart
-        # regardless of whether they are similar or dissimilar
-        distance_loss = -torch.mean((1.0 - torch.abs(similarity_matrix[mask])))
-        
-        return distance_loss
+        pass
 
     def forward(self, encoder_input_ids, encoder_attention_mask, steps_input_ids, steps_attention_mask, steps_valid_mask, accelerator=None):
         """
@@ -242,7 +201,7 @@ class AutoEncoderModel(nn.Module):
           - Projects encoder outputs and builds decoder inputs.
           - Computes predictions via the decoder.
           - Projects decoder outputs.
-          - Computes a cross-entropy loss via the translator branch (frozen if freeze=True).
+          - Computes a cross-entropy loss via the decoder branch (frozen if freeze=True).
         """
         device = encoder_input_ids.device
         valid_steps = steps_input_ids[steps_valid_mask]
@@ -266,7 +225,7 @@ class AutoEncoderModel(nn.Module):
             encoder_hidden_states = enc_outputs.last_hidden_state
 
         # Project encoder hidden states before passing to decoder
-        projected_encoder_hidden = self.encoder_to_decoder_proj(encoder_hidden_states)
+        projected_encoder_hidden = self.encoder_to_latent_model_proj(encoder_hidden_states)
 
         # Apply dropout AFTER projection
         projected_encoder_hidden = F.dropout(projected_encoder_hidden, p=self.dropout_rate, training=self.training)
@@ -274,7 +233,7 @@ class AutoEncoderModel(nn.Module):
         all_latent_inputs, all_latent_targets, decoder_attention_mask, latent_ce_labels = self.build_decoder_inputs(
             encoder_input_ids, projected_encoder_hidden, valid_attention, steps_valid_mask
         )
-        decoder_outputs = self.decoder.transformer(
+        decoder_outputs = self.latent_model.transformer(
             inputs_embeds=all_latent_inputs,
             return_dict=True # Ensure return_dict is True if accessing by name
         )
@@ -287,35 +246,35 @@ class AutoEncoderModel(nn.Module):
         target_mask = (all_latent_targets.abs().sum(dim=-1) != 0)
 
         # Project the relevant decoder hidden states (after dropout)
-        # No detach needed before projection; no_grad context for translator handles gradients
-        translator_prefix_to_project = decoder_hidden_dropped[target_mask]
-        translator_prefix_projected = self.decoder_to_translator_proj(translator_prefix_to_project)
-        translator_prefix = translator_prefix_projected.unsqueeze(1) # Add sequence dimension
+        # No detach needed before projection; no_grad context for decoder handles gradients
+        decoder_prefix_to_project = decoder_hidden_dropped[target_mask]
+        decoder_prefix_projected = self.latent_model_to_decoder_proj(decoder_prefix_to_project)
+        decoder_prefix = decoder_prefix_projected.unsqueeze(1) # Add sequence dimension
 
         valid_steps_input_ids = steps_input_ids[steps_valid_mask]
         valid_steps_attention_mask = steps_attention_mask[steps_valid_mask]
         
-        # with torch.no_grad(): # Translator is frozen
+        # with torch.no_grad(): # Decoder is frozen
         if True:
-            translator_embeds = self.translator.transformer.wte(valid_steps_input_ids)
+            decoder_embeds = self.decoder.transformer.wte(valid_steps_input_ids)
             # Concatenate the *projected* decoder prefix with the *original* target token embeddings
-            translator_embeds_combined = torch.cat([translator_prefix, translator_embeds], dim=1)
-            translator_attention_mask = torch.cat([torch.ones((valid_steps_attention_mask.size(0), 1), device=device, dtype=torch.long), valid_steps_attention_mask], dim=1)
+            decoder_embeds_combined = torch.cat([decoder_prefix, decoder_embeds], dim=1)
+            decoder_attention_mask = torch.cat([torch.ones((valid_steps_attention_mask.size(0), 1), device=device, dtype=torch.long), valid_steps_attention_mask], dim=1)
 
             # torch.cuda.empty_cache()
 
-            translator_outputs = self.translator(
-                inputs_embeds=translator_embeds_combined,
-                attention_mask=translator_attention_mask,
+            decoder_outputs = self.decoder(
+                inputs_embeds=decoder_embeds_combined,
+                attention_mask=decoder_attention_mask,
                 return_dict=True
             )
-            translator_logits = translator_outputs.logits
+            decoder_logits = decoder_outputs.logits
 
-        shift_logits = translator_logits.contiguous()
+        shift_logits = decoder_logits.contiguous()
         shift_labels = valid_steps_input_ids.contiguous()
         shift_labels = torch.cat([shift_labels, torch.full((shift_labels.size(0), 1), self.tokenizer.eos_token_id, device=device, dtype=shift_labels.dtype)], dim=1)
 
-        pad_token_id = self.decoder.config.pad_token_id
+        pad_token_id = self.latent_model.config.pad_token_id
         ce_mask = torch.cumsum((shift_labels == pad_token_id).to(torch.int), dim=1) <= 1
 
         predictions = shift_logits.view(-1, shift_logits.size(-1))
@@ -342,47 +301,15 @@ class AutoEncoderModel(nn.Module):
             labels = torch.arange(local_batch_size).to(device)
 
             contrastive_loss = F.cross_entropy(similarity_matrix / temperature, labels)
-
-            # Calculate distance loss only if use_dist is enabled
-            if self.use_dist:
-                # Calculate distance loss to encourage maximum distance between pred_latents
-                distance_loss1 = self.calculate_distance_loss(pred_latents) # Use original decoder_hidden
-                distance_loss2 = self.calculate_distance_loss(target_latents)
-                distance_loss = distance_loss1 + distance_loss2
-            else:
-                distance_loss = torch.tensor(0.0, device=device, dtype=decoder_hidden.dtype)
-                distance_loss1 = torch.tensor(0.0, device=device, dtype=decoder_hidden.dtype)
-                distance_loss2 = torch.tensor(0.0, device=device, dtype=decoder_hidden.dtype)
-
-            # Calculate MSE loss if enabled
-            if self.use_mse:
-                # MSE loss between predicted latents and target latents
-                mse_loss = F.mse_loss(pred_latents, target_latents) # Use original decoder_hidden
-            else:
-                mse_loss = torch.tensor(0.0, device=device, dtype=decoder_hidden.dtype)
-
         else:
             contrastive_loss = torch.tensor(0.0, device=device, dtype=decoder_hidden.dtype)
-            distance_loss = torch.tensor(0.0, device=device, dtype=decoder_hidden.dtype)
-            distance_loss1 = torch.tensor(0.0, device=device, dtype=decoder_hidden.dtype)
-            distance_loss2 = torch.tensor(0.0, device=device, dtype=decoder_hidden.dtype)
-            mse_loss = torch.tensor(0.0, device=device, dtype=decoder_hidden.dtype)
 
         # Add all applicable losses to the total loss
-        # Note: Gradients will flow back through decoder and projection layers, but stop at encoder and translator.
         total_loss = ce_loss + contrastive_loss
-        if self.use_dist:
-            total_loss = total_loss + distance_loss
-        if self.use_mse:
-            total_loss = total_loss + mse_loss
 
         return {
             "ce_loss": ce_loss,
             "cont_loss": contrastive_loss,
-            "distance_loss": distance_loss,
-            "distance_loss1": distance_loss1,
-            "distance_loss2": distance_loss2,
-            "mse_loss": mse_loss,
             "total_loss": total_loss,
         }
 
@@ -401,8 +328,8 @@ class AutoEncoderModel(nn.Module):
         """
         # Set all modules to evaluation mode.
         self.encoder.eval()
+        self.latent_model.eval()
         self.decoder.eval()
-        self.translator.eval()
 
         gt_labels = self._extract_ground_truth(encoder_input_ids)
         device = encoder_input_ids.device
@@ -467,13 +394,13 @@ class AutoEncoderModel(nn.Module):
         """
         # Build initial decoder inputs.
         decoder_inputs, decoder_att_mask, decoder_position_ids = self.pad_question(encoder_input_ids)
-        decoder_inputs_embeds = self.decoder.transformer.wte(decoder_inputs)
+        decoder_inputs_embeds = self.latent_model.transformer.wte(decoder_inputs)
         N = 10
 
         # Generate latent tokens over N iterations.
         for _ in range(N):
             with torch.no_grad():
-                decoder_out = self.decoder.transformer(
+                decoder_out = self.latent_model.transformer(
                     inputs_embeds=decoder_inputs_embeds,
                     attention_mask=decoder_att_mask,
                     position_ids=decoder_position_ids,
@@ -495,10 +422,10 @@ class AutoEncoderModel(nn.Module):
 
         # Extract the generated latent representations.
         target_out = decoder_inputs_embeds[:, -N:].reshape(-1, decoder_inputs_embeds.size(-1))
-        target_out_projected = self.decoder_to_translator_proj(target_out)
+        target_out_projected = self.latent_model_to_decoder_proj(target_out)
         
         with torch.no_grad():
-            translator_out = self.translator.generate(
+            translator_out = self.decoder.generate(
                 inputs_embeds=target_out_projected.unsqueeze(1),
                 do_sample=False,
                 temperature=0,
@@ -542,7 +469,7 @@ class AutoEncoderModel(nn.Module):
         next_index = len(existing_files) + 1
 
         decoder_inputs, decoder_att_mask, decoder_position_ids = self.pad_question(encoder_input_ids)
-        decoder_inputs_embeds = self.decoder.transformer.wte(decoder_inputs)
+        decoder_inputs_embeds = self.latent_model.transformer.wte(decoder_inputs)
         N = 10
         results = ["" for _ in range(encoder_input_ids.size(0))]
         semi_acc = 0
@@ -552,7 +479,7 @@ class AutoEncoderModel(nn.Module):
         for _ in range(N):
             with torch.no_grad():
                 # 1. DECODER STEP
-                decoder_out = self.decoder.transformer(
+                decoder_out = self.latent_model.transformer(
                     inputs_embeds=decoder_inputs_embeds,
                     attention_mask=decoder_att_mask,
                     position_ids=decoder_position_ids,
@@ -576,10 +503,10 @@ class AutoEncoderModel(nn.Module):
                 target_out_unprojected = last_hidden.reshape(-1, last_hidden.size(-1)) # Unprojected latent [B, H]
 
                 # Apply decoder-to-translator projection
-                target_out_projected = self.decoder_to_translator_proj(target_out_unprojected)
+                target_out_projected = self.latent_model_to_decoder_proj(target_out_unprojected)
 
                 with torch.no_grad():
-                    translator_out = self.translator.generate(
+                    translator_out = self.decoder.generate(
                         inputs_embeds=target_out_projected.unsqueeze(1), # Use projected
                         max_new_tokens=128, # Add max_new_tokens
                         do_sample=False,
@@ -621,7 +548,7 @@ class AutoEncoderModel(nn.Module):
                 encoder_hidden_states_unprojected = encoder_hidden_states_full[batch_range, first_newlines, :] # [B, H]
 
                 # Apply encoder-to-decoder projection
-                encoder_hidden_states_projected = self.encoder_to_decoder_proj(encoder_hidden_states_unprojected)
+                encoder_hidden_states_projected = self.encoder_to_latent_model_proj(encoder_hidden_states_unprojected)
 
                 # Save the extracted tensors
                 # embedding_pairs = []
@@ -680,14 +607,14 @@ class AutoEncoderModel(nn.Module):
             # No detach needed here as we are in no_grad context already
 
             # Project encoder hidden states
-            projected_encoder_hidden = self.encoder_to_decoder_proj(encoder_hidden_states)
+            projected_encoder_hidden = self.encoder_to_latent_model_proj(encoder_hidden_states)
             # No dropout needed in eval mode
 
             # Build decoder inputs for valid steps using projected encoder states.
             all_latent_inputs, all_latent_targets, decoder_attention_mask, latent_ce_labels = self.build_decoder_inputs(
                 encoder_input_ids, projected_encoder_hidden, valid_attention, steps_valid_mask
             )
-            decoder_outputs = self.decoder.transformer(
+            decoder_outputs = self.latent_model.transformer(
                 inputs_embeds=all_latent_inputs,
                 return_dict=True # Ensure return_dict is True
             )
@@ -708,29 +635,29 @@ class AutoEncoderModel(nn.Module):
                         counter += 1
 
             # Project the relevant decoder hidden states
-            translator_prefix_unprojected = decoder_hidden[target_mask]
-            translator_prefix_projected = self.decoder_to_translator_proj(translator_prefix_unprojected)
-            translator_prefix = translator_prefix_projected.unsqueeze(1) # Add sequence dimension
+            decoder_prefix_unprojected = decoder_hidden[target_mask]
+            decoder_prefix_projected = self.latent_model_to_decoder_proj(decoder_prefix_unprojected)
+            decoder_prefix = decoder_prefix_projected.unsqueeze(1) # Add sequence dimension
 
             valid_stage_indices = stage_indices[target_mask]
             valid_steps_input_ids = steps_input_ids[steps_valid_mask]
             valid_steps_attention_mask = steps_attention_mask[steps_valid_mask]
 
 
-            translator_embeds = self.translator.transformer.wte(valid_steps_input_ids)
+            decoder_embeds = self.decoder.transformer.wte(valid_steps_input_ids)
             # Concatenate the *projected* decoder prefix
-            translator_embeds_combined = torch.cat([translator_prefix, translator_embeds], dim=1)
-            translator_attention_mask = torch.cat(
+            decoder_embeds_combined = torch.cat([decoder_prefix, decoder_embeds], dim=1)
+            decoder_attention_mask = torch.cat(
                 [torch.ones((valid_steps_attention_mask.size(0), 1), device=device, dtype=torch.long), valid_steps_attention_mask],
                 dim=1,
             )
 
-            valid_gen_indices = (translator_attention_mask[:, 0] == 1).nonzero(as_tuple=True)[0]
+            valid_gen_indices = (decoder_attention_mask[:, 0] == 1).nonzero(as_tuple=True)[0]
             # Generate using only the projected prefix as input_embeds
-            # Note: translator.generate might need adjustment if it expects token IDs
+            # Note: decoder.generate might need adjustment if it expects token IDs
             # Assuming it works correctly with inputs_embeds directly for the first token
-            generated_translations = self.translator.generate(
-                inputs_embeds=translator_prefix[valid_gen_indices], # Pass projected prefix
+            generated_translations = self.decoder.generate(
+                inputs_embeds=decoder_prefix[valid_gen_indices], # Pass projected prefix
                 max_new_tokens=128, # Add a reasonable max length
                 do_sample=False,
                 temperature=0,
@@ -833,25 +760,23 @@ class AutoEncoderModel(nn.Module):
         os.makedirs(save_dir, exist_ok=True)
         
         # Save projection layers state dictionaries
-        torch.save(self.encoder_to_decoder_proj.state_dict(), os.path.join(save_dir, "encoder_to_decoder_proj.pt"))
-        torch.save(self.decoder_to_translator_proj.state_dict(), os.path.join(save_dir, "decoder_to_translator_proj.pt"))
+        torch.save(self.encoder_to_latent_model_proj.state_dict(), os.path.join(save_dir, "encoder_to_latent_model_proj.pt"))
+        torch.save(self.latent_model_to_decoder_proj.state_dict(), os.path.join(save_dir, "latent_model_to_decoder_proj.pt"))
         
         # Save model state dictionaries - save all components regardless of sharing
-        torch.save(self.decoder.state_dict(), os.path.join(save_dir, "decoder.pt"))
+        torch.save(self.latent_model.state_dict(), os.path.join(save_dir, "latent_model.pt"))
         torch.save(self.encoder.state_dict(), os.path.join(save_dir, "encoder.pt"))
-        torch.save(self.translator.state_dict(), os.path.join(save_dir, "translator.pt"))
+        torch.save(self.decoder.state_dict(), os.path.join(save_dir, "decoder.pt"))
         
         # Save configuration
         config = {
             "task": self.task,
             "share_param": self.config["share_param"],
             "use_cont": self.use_cont,
-            "use_dist": self.use_dist,
-            "use_mse": self.use_mse,
             "dropout_rate": self.dropout_rate,
             "encoder_path": self.encoder.config._name_or_path,
-            "decoder_path": self.decoder.config._name_or_path,
-            "translator_path": self.translator.config._name_or_path if not self.config["share_param"] else None,
+            "latent_model_path": self.latent_model.config._name_or_path,
+            "decoder_path": self.decoder.config._name_or_path if not self.config["share_param"] else None,
             "tokenizer_name": self.tokenizer.name_or_path
         }
         
@@ -862,14 +787,14 @@ class AutoEncoderModel(nn.Module):
         self.tokenizer.save_pretrained(os.path.join(save_dir, "tokenizer"))
         
         # Also save the complete model architectures - save all regardless of sharing
-        self.encoder.save_pretrained(os.path.join(save_dir, "encoder_model"))
-        self.decoder.save_pretrained(os.path.join(save_dir, "decoder_model"))
-        self.translator.save_pretrained(os.path.join(save_dir, "translator_model"))
+        self.encoder.save_pretrained(os.path.join(save_dir, "encoder"))
+        self.latent_model.save_pretrained(os.path.join(save_dir, "latent_model"))
+        self.decoder.save_pretrained(os.path.join(save_dir, "decoder"))
         
         print(f"Model saved to {save_dir}")
         
     @classmethod
-    def load_model(cls, load_dir, tokenizer=None, task=None, use_cont=None, use_dist=None, use_mse=None, freeze=False):
+    def load_model(cls, load_dir, tokenizer=None, task=None, use_cont=None, freeze=False):
         """
         Load a saved model from directory.
         
@@ -878,8 +803,6 @@ class AutoEncoderModel(nn.Module):
             tokenizer (Optional): Pre-loaded tokenizer. If None, will load from saved files
             task (str, Optional): Task name, overrides the saved task if provided
             use_cont (bool, Optional): Whether to use contrastive loss, overrides saved setting if provided
-            use_dist (bool, Optional): Whether to use distance loss, overrides saved setting if provided
-            use_mse (bool, Optional): Whether to use MSE loss, overrides saved setting if provided
             
         Returns:
             AutoEncoderModel: Loaded model instance
@@ -896,10 +819,6 @@ class AutoEncoderModel(nn.Module):
             config["task"] = task
         if use_cont is not None:
             config["use_cont"] = use_cont
-        if use_dist is not None:
-            config["use_dist"] = use_dist
-        if use_mse is not None:
-            config["use_mse"] = use_mse
         
         # Load tokenizer if not provided
         if tokenizer is None:
@@ -909,14 +828,12 @@ class AutoEncoderModel(nn.Module):
         model = cls(
             tokenizer=tokenizer,
             encoder_path=config["encoder_path"],
+            latent_model_path=config["latent_model_path"],
             decoder_path=config["decoder_path"],
-            translator_path=config["encoder_path"] if config["share_param"] else config["translator_path"],
             task=config["task"],
             freeze=freeze,
             share_param=config["share_param"],
-            use_cont=config["use_cont"],
-            use_dist=config["use_dist"],
-            use_mse=config["use_mse"]
+            use_cont=config["use_cont"]
         )
         
         # Update dropout rate if different
@@ -925,23 +842,23 @@ class AutoEncoderModel(nn.Module):
         print("Load dir", load_dir)
 
         # Load saved state dictionaries
-        model.encoder_to_decoder_proj.load_state_dict(
-            torch.load(os.path.join(load_dir, "encoder_to_decoder_proj.pt"))
+        model.encoder_to_latent_model_proj.load_state_dict(
+            torch.load(os.path.join(load_dir, "encoder_to_latent_model_proj.pt"))
         )
-        model.decoder_to_translator_proj.load_state_dict(
-            torch.load(os.path.join(load_dir, "decoder_to_translator_proj.pt"))
+        model.latent_model_to_decoder_proj.load_state_dict(
+            torch.load(os.path.join(load_dir, "latent_model_to_decoder_proj.pt"))
         )
-        model.decoder.load_state_dict(
-            torch.load(os.path.join(load_dir, "decoder.pt"))
+        model.latent_model.load_state_dict(
+            torch.load(os.path.join(load_dir, "latent_model.pt"))
         )
         model.encoder.load_state_dict(
             torch.load(os.path.join(load_dir, "encoder.pt"))
         )
         
-        # Load translator state if it's not shared with the encoder
+        # Load decoder state if it's not shared with the encoder
         if not config["share_param"]:
-            model.translator.load_state_dict(
-                torch.load(os.path.join(load_dir, "translator.pt"))
+            model.decoder.load_state_dict(
+                torch.load(os.path.join(load_dir, "decoder.pt"))
             )
         
         print(f"Model loaded from {load_dir}")

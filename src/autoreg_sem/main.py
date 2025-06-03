@@ -38,10 +38,10 @@ def main():
     # Set global seed for reproducibility before any random operations or Accelerator instantiation
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=100)
     parser.add_argument("--encoder_path", type=str, required=False)
+    parser.add_argument("--latent_model_path", type=str, required=False)
     parser.add_argument("--decoder_path", type=str, required=False)
-    parser.add_argument("--translator_path", type=str, required=False)
     parser.add_argument("--tokenizer_path", type=str, required=True)
     parser.add_argument("--complete_model_path", type=str, default=None, help="Path to load complete model from")
     
@@ -54,20 +54,21 @@ def main():
     
     parser.add_argument("--proj_name", type=str, default="My_project")
     parser.add_argument("--exp_name", type=str, default="My_experiment")
+    parser.add_argument("--wandb_key", type=str, default=None, help="Weights & Biases API key")
+    parser.add_argument("--wandb_entity", type=str, default="hbin0701", help="Weights & Biases entity (username or team name)")
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
+
     
     parser.add_argument("--task", type=str, default="gsm8k")
-    parser.add_argument('--freeze', action='store_true', help='Whether to freeze the encoder & translator or not.')
-    parser.add_argument('--share_param', action='store_true', help='Whether for encoder & translator to share the weight or not.')
+    parser.add_argument('--freeze', action='store_true', help='Whether to freeze the encoder & decoder or not.')
+    parser.add_argument('--share_param', action='store_true', help='Whether for encoder & decoder to share the weight or not.')
     parser.add_argument('--use_cont', action='store_true', help='Whether to use contrastive loss or not.')
-    parser.add_argument('--use_dist', action='store_true', help='Whether to use distance loss or not.')
-    parser.add_argument('--use_mse', action='store_true', help='Whether to use MSE loss between predicted and target latents.')
     
     args = parser.parse_args()
     
     # Validate that either complete_model_path or all component paths are provided
-    if args.complete_model_path is None and (args.encoder_path is None or args.decoder_path is None or args.translator_path is None):
-        raise ValueError("Either complete_model_path or all of encoder_path, decoder_path, and translator_path must be provided")
+    if args.complete_model_path is None and (args.encoder_path is None or args.latent_model_path is None or args.decoder_path is None):
+        raise ValueError("Either complete_model_path or all of encoder_path, latent_model_path, and decoder_path must be provided")
     
     set_seed(args.seed)
 
@@ -114,16 +115,14 @@ def main():
             args.complete_model_path, 
             tokenizer=tokenizer, 
             task=args.task, 
-            use_cont=args.use_cont, 
-            use_dist=args.use_dist, 
-            use_mse=args.use_mse,
+            use_cont=args.use_cont,
             freeze=args.freeze
         )
     else:
         # Load model components separately as before
         model = AutoEncoderModel(
-            tokenizer, args.encoder_path, args.decoder_path, args.translator_path, 
-            args.task, args.freeze, args.share_param, args.use_cont, args.use_dist, args.use_mse
+            tokenizer, args.encoder_path, args.latent_model_path, args.decoder_path, 
+            args.task, args.freeze, args.share_param, args.use_cont
         )
     
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)

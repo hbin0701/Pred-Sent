@@ -9,9 +9,9 @@ export TOKENIZERS_PARALLELISM=false
 #=============================================================================
 # Data paths
 #=============================================================================
-TRAIN_FILE="../../../../data/gsm8k/train.json"
-VALID_FILE="../../../../data/gsm8k/valid.json"
-TEST_FILE="../../../../data/gsm8k/test.json"
+TRAIN_FILE="../../../data/gsm8k/train.json"
+VALID_FILE="../../../data/gsm8k/valid.json"
+TEST_FILE="../../../data/gsm8k/test.json"
 TASK="gsm8k"
 
 #=============================================================================
@@ -45,11 +45,14 @@ TEMPERATURE=0.1
 #=============================================================================
 # Experiment tracking
 #=============================================================================
+# WANDB SETTING
 PROJ_NAME="PROJ_NAME"
 EXP_NAME="EXP_NAME"
-SAVE_DIR="SAVE_DIR"
 WANDB_KEY="YOUR_WANDB_API_KEY"
 WANDB_ENTITY="YOUR_WANDB_ENTITY"
+
+# SAVE_DIR
+SAVE_DIR="SAVE_DIR"
 
 #=============================================================================
 # Launch training
