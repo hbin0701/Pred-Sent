@@ -11,7 +11,7 @@ import os
 import pickle
 from peft import PeftModel, LoraConfig, get_peft_model
 
-class AutoEncoderModel(nn.Module):
+class AutoRegressiveModel(nn.Module):
     def __init__(self, tokenizer, encoder_path, latent_model_path, decoder_path, task, freeze, share_param, use_cont):
         """
         Loads the encoder, latent model, and decoder models.
@@ -334,45 +334,22 @@ class AutoEncoderModel(nn.Module):
         gt_labels = self._extract_ground_truth(encoder_input_ids)
         device = encoder_input_ids.device
 
-        # Part I: Measure standard accuracy.
-        acc, pos_acc, prev_pos_acc, grouped_outputs = self._measure_acc(encoder_input_ids, gt_labels, device)
+        # Part I: Measure continuous accuracy.
+        cont, cont_pos, grouped_outputs = self._measure_cont_acc(encoder_input_ids, gt_labels, device)
 
-        # Part II: Measure semi-accuracy.
-        semi_acc, semi_pos_acc, semi_prev_pos_acc, semi_outputs = self._measure_semi_acc(encoder_input_ids, gt_labels, device, mode=mode)
-
-        # Part III: Measure GT accuracy (if applicable to task).
-        
-        # Comment this out.
-        if False: 
-        # if self.task in ["gsm8k", "prosqa", "fw-edu", "csqa"]:
-            stage_acc_dict, gt_ls_acc, gt_non_ls_acc, total_steps = self._measure_gt_acc(
-                encoder_input_ids,
-                encoder_attention_mask,
-                steps_input_ids,
-                steps_attention_mask,
-                steps_valid_mask,
-                device,
-            )
-        else:
-            stage_acc_dict, gt_ls_acc, gt_non_ls_acc, total_steps = {}, 0, 0, 0
+        # Part II: Measure discretized accuracy.
+        disc_acc, disc_pos_acc, disc_outputs = self._measure_disc_acc(encoder_input_ids, gt_labels, device, mode=mode)
 
         # Log sample predictions if in test mode.
         if mode == "test":
-            self._log_sample_predictions(step, encoder_input_ids, gt_labels, semi_outputs)
+            self._log_sample_predictions(step, encoder_input_ids, gt_labels, disc_outputs)
 
         return {
-            "acc": acc,
-            "pos_acc": pos_acc,
-            "prev_pos_acc": acc + prev_pos_acc,
-            "semi_acc": semi_acc,
-            "semi_pos_acc": semi_pos_acc,
-            "semi_prev_pos_acc": semi_acc + semi_prev_pos_acc,
-            "total_steps": total_steps,
-            "gt_ls_acc": gt_ls_acc,
-            "gt_non_ls_acc": gt_non_ls_acc,
-            **stage_acc_dict,  # e.g., "stage0_acc", "stage1_acc", etc.
+            "cont": cont,
+            "cont_pos": cont_pos,
+            "disc_acc": disc_acc,
+            "disc_pos_acc": disc_pos_acc
         }
-
 
     def _extract_ground_truth(self, encoder_input_ids):
         """
@@ -386,11 +363,10 @@ class AutoEncoderModel(nn.Module):
         gt_labels = [x[x.index("\n"):] if "\n" in x else "" for x in gt_labels]
         return gt_labels
 
-
-    def _measure_acc(self, encoder_input_ids, gt_labels, device):
+    def _measure_cont_acc(self, encoder_input_ids, gt_labels, device):
         """
         Part I: Generate latent representations using the decoder,
-        translate them, and calculate exact/near-match accuracy.
+        translate them, and calculate continuous accuracy.
         """
         # Build initial decoder inputs.
         decoder_inputs, decoder_att_mask, decoder_position_ids = self.pad_question(encoder_input_ids)
@@ -436,29 +412,24 @@ class AutoEncoderModel(nn.Module):
             "".join(decoded_outputs[i : i + N]) for i in range(0, len(decoded_outputs), N)
         ]
 
-        # Calculate accuracy metrics.
-        acc = 0
-        pos_acc = 0
-        prev_pos_acc = 0
+        # Calculate continuous accuracy metrics.
+        cont = 0
+        cont_pos = 0
         for a, b in zip(grouped_outputs, gt_labels):
             if self.task == "gsm8k":
                 if compare_last_formula(a) == extract_final_answer(b, self.task):
-                    pos_acc += 1
+                    cont_pos += 1
             if extract_final_answer(a, self.task) == extract_final_answer(b, self.task):
-                acc += 1
-            else:
-                if compare_last_formula(a) == compare_last_formula(b):
-                    prev_pos_acc += 1
+                cont += 1
 
         if self.task != "gsm8k":
-            pos_acc = acc
+            cont_pos = cont
 
-        return acc, pos_acc, prev_pos_acc, grouped_outputs
+        return cont, cont_pos, grouped_outputs
 
-
-    def _measure_semi_acc(self, encoder_input_ids, gt_labels, device, mode="test"):
+    def _measure_disc_acc(self, encoder_input_ids, gt_labels, device, mode="test"):
         """
-        Part II: Iteratively generate outputs, project, re-encode, project, and calculate semi-accuracy.
+        Part II: Iteratively generate outputs, project, re-encode, project, and calculate discretized accuracy.
         """
         # Create directory structure for saving embeddings
         embedding_dir = os.path.join("embeddings", mode)
@@ -472,9 +443,8 @@ class AutoEncoderModel(nn.Module):
         decoder_inputs_embeds = self.latent_model.transformer.wte(decoder_inputs)
         N = 10
         results = ["" for _ in range(encoder_input_ids.size(0))]
-        semi_acc = 0
-        semi_pos_acc = 0
-        semi_prev_pos_acc = 0
+        disc_acc = 0
+        disc_pos_acc = 0
 
         for _ in range(N):
             with torch.no_grad():
@@ -550,170 +520,24 @@ class AutoEncoderModel(nn.Module):
                 # Apply encoder-to-decoder projection
                 encoder_hidden_states_projected = self.encoder_to_latent_model_proj(encoder_hidden_states_unprojected)
 
-                # Save the extracted tensors
-                # embedding_pairs = []
-                # for i in range(batch_size):
-                #     # Extract tensors for each sample in the batch
-                #     sample_last_hidden = target_out_unprojected[i].detach().cpu()
-                #     sample_encoder_projected = encoder_hidden_states_projected[i].detach().cpu()
-                #     embedding_pairs.append((sample_last_hidden, sample_encoder_projected))
-                
-                # # Save batch embeddings to pickle file
-                # pickle_path = os.path.join(embedding_dir, f"tensors{next_index}.pkl")
-                # with open(pickle_path, 'wb') as f:
-                #     pickle.dump(embedding_pairs, f)
-                # next_index += 1
-
                 # Append projected encoder state to decoder inputs for next step
                 decoder_inputs_embeds = torch.cat(
                     [decoder_inputs_embeds, encoder_hidden_states_projected.unsqueeze(1)], # Use projected
                     dim=1
                 )
 
-        # Calculate semi-accuracy.
+        # Calculate discretized accuracy.
         for a, b in zip(results, gt_labels):
             if self.task == "gsm8k":
                 if compare_last_formula(a) == extract_final_answer(b, self.task):
-                    semi_pos_acc += 1
+                    disc_pos_acc += 1
             if extract_final_answer(a, self.task) == extract_final_answer(b, self.task):
-                semi_acc += 1
-            else:
-                if compare_last_formula(a) == compare_last_formula(b):
-                    semi_prev_pos_acc += 1
+                disc_acc += 1
 
         if self.task != "gsm8k":
-            semi_pos_acc = semi_acc
+            disc_pos_acc = disc_acc
 
-        return semi_acc, semi_pos_acc, semi_prev_pos_acc, results
-
-
-    def _measure_gt_acc(
-        self, encoder_input_ids, encoder_attention_mask, steps_input_ids, steps_attention_mask, steps_valid_mask, device
-    ):
-        """
-        Part III: Compute GT accuracy by re-encoding valid steps and grouping predictions by stage.
-        Uses projection layers and detaching.
-        """
-        with torch.no_grad(): # Everything should be no_grad in test mode
-            valid_steps = steps_input_ids[steps_valid_mask]
-            valid_attention = steps_attention_mask[steps_valid_mask]
-            enc_outputs = self.encoder.transformer(
-                input_ids=valid_steps,
-                attention_mask=valid_attention,
-                return_dict=True,
-            )
-            # last_hidden_state already has ln_f applied
-            encoder_hidden_states = enc_outputs.last_hidden_state
-            # No detach needed here as we are in no_grad context already
-
-            # Project encoder hidden states
-            projected_encoder_hidden = self.encoder_to_latent_model_proj(encoder_hidden_states)
-            # No dropout needed in eval mode
-
-            # Build decoder inputs for valid steps using projected encoder states.
-            all_latent_inputs, all_latent_targets, decoder_attention_mask, latent_ce_labels = self.build_decoder_inputs(
-                encoder_input_ids, projected_encoder_hidden, valid_attention, steps_valid_mask
-            )
-            decoder_outputs = self.latent_model.transformer(
-                inputs_embeds=all_latent_inputs,
-                return_dict=True # Ensure return_dict is True
-            )
-            # last_hidden_state already has ln_f applied
-            decoder_hidden = decoder_outputs.last_hidden_state
-            # No detach needed here as we are in no_grad context already
-
-            target_mask = (all_latent_targets.abs().sum(dim=-1) != 0)
-            B, L_dec = target_mask.shape
-
-            # Assign stage indices for valid tokens.
-            stage_indices = torch.zeros_like(all_latent_targets, dtype=torch.long)
-            for b in range(B):
-                counter = 0
-                for i in range(L_dec):
-                    if target_mask[b, i]:
-                        stage_indices[b, i] = counter
-                        counter += 1
-
-            # Project the relevant decoder hidden states
-            decoder_prefix_unprojected = decoder_hidden[target_mask]
-            decoder_prefix_projected = self.latent_model_to_decoder_proj(decoder_prefix_unprojected)
-            decoder_prefix = decoder_prefix_projected.unsqueeze(1) # Add sequence dimension
-
-            valid_stage_indices = stage_indices[target_mask]
-            valid_steps_input_ids = steps_input_ids[steps_valid_mask]
-            valid_steps_attention_mask = steps_attention_mask[steps_valid_mask]
-
-
-            decoder_embeds = self.decoder.transformer.wte(valid_steps_input_ids)
-            # Concatenate the *projected* decoder prefix
-            decoder_embeds_combined = torch.cat([decoder_prefix, decoder_embeds], dim=1)
-            decoder_attention_mask = torch.cat(
-                [torch.ones((valid_steps_attention_mask.size(0), 1), device=device, dtype=torch.long), valid_steps_attention_mask],
-                dim=1,
-            )
-
-            valid_gen_indices = (decoder_attention_mask[:, 0] == 1).nonzero(as_tuple=True)[0]
-            # Generate using only the projected prefix as input_embeds
-            # Note: decoder.generate might need adjustment if it expects token IDs
-            # Assuming it works correctly with inputs_embeds directly for the first token
-            generated_translations = self.decoder.generate(
-                inputs_embeds=decoder_prefix[valid_gen_indices], # Pass projected prefix
-                max_new_tokens=128, # Add a reasonable max length
-                do_sample=False,
-                temperature=0,
-            )
-            # The rest of the logic remains similar...
-            decoded_translations = [
-                self.tokenizer.decode(t, skip_special_tokens=True) for t in generated_translations
-            ]
-            decoded_targets = [
-                self.tokenizer.decode(valid_steps_input_ids[i], skip_special_tokens=True)
-                for i in valid_gen_indices
-            ]
-            valid_stage_numbers = valid_stage_indices[valid_gen_indices].tolist()
-
-            stage_total = {}
-            stage_correct = {}
-            gt_non_ls = []
-            gt_ls = []
-
-            for stage, pred, target in zip(valid_stage_numbers, decoded_translations, decoded_targets):
-                # Use your check_eq (or equivalent) to determine correctness.
-                stage = stage[0]
-                correct = check_eq(pred, target)
-                
-                if self.task == "gsm8k":
-                    non_ls_cond = ">>" in target
-                elif self.task == "csqa":
-                    non_ls_cond = "###" not in target
-                else:
-                    raise NotImplementedError(f"Task {self.task} not implemented.")
-                
-                if non_ls_cond:
-                    gt_non_ls.append(correct)
-                    stage_total[stage] = stage_total.get(stage, 0) + 1
-                    stage_correct[stage] = stage_correct.get(stage, 0) + int(correct)
-                else:
-                    gt_ls.append(correct)
-                    
-            # import pdb;
-            # pdb.set_trace()
-            
-            if len(gt_ls) != len(encoder_input_ids):
-                print("ERROR")
-                print(len(gt_ls), len(encoder_input_ids))
-
-            gt_ls_acc = gt_ls.count(True)
-            gt_non_ls_acc = gt_non_ls.count(True)
-            stage_acc_dict = {}
-            for stage in sorted(stage_total.keys()):
-                stage_acc_dict[f"stage{stage}_acc"] = stage_correct[stage]
-                stage_acc_dict[f"stage{stage}_total"] = stage_total[stage]
-
-            total_steps = len(decoded_targets)
-
-        return stage_acc_dict, gt_ls_acc, gt_non_ls_acc, total_steps
-
+        return disc_acc, disc_pos_acc, results
 
     def _log_sample_predictions(self, step, encoder_input_ids, gt_labels, predictions):
         """
@@ -732,11 +556,11 @@ class AutoEncoderModel(nn.Module):
                 "Input": [self.tokenizer.decode(encoder_input_ids[i]) for i in sample_indices],
                 "Predictions": [predictions[i] for i in sample_indices],
                 "Ground Truth": [gt_labels[i] for i in sample_indices],
-                "Pos_Acc": [
+                "Cont_Pos": [
                     compare_last_formula(predictions[i]) == compare_last_formula(gt_labels[i])
                     for i in sample_indices
                 ],
-                "Acc": [
+                "Cont": [
                     extract_final_answer(predictions[i], self.task)
                     == extract_final_answer(gt_labels[i], self.task)
                     for i in sample_indices
@@ -805,7 +629,7 @@ class AutoEncoderModel(nn.Module):
             use_cont (bool, Optional): Whether to use contrastive loss, overrides saved setting if provided
             
         Returns:
-            AutoEncoderModel: Loaded model instance
+            AutoRegressiveModel: Loaded model instance
         """
         import os
         import json

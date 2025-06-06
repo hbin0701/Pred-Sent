@@ -1,6 +1,6 @@
 # Autoregressive Semantic Embedding Model
 
-This module trians Autoregressive Model using the Encoder / Decoder obtained after training for Semantic embedings.
+This module trains Autoregressive Model using the Encoder / Decoder obtained after training for Semantic embedings.
 
 ## Model Architecture
 

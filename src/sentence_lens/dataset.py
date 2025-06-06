@@ -2,8 +2,6 @@ import os
 from datasets import load_dataset
 from torch.utils.data import Dataset
 
-
-
 class StepsDataset(Dataset):
     def __init__(self, file_path, tokenizer, max_length=1024, num_proc=16):
         self.tokenizer = tokenizer

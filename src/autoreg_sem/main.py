@@ -10,7 +10,7 @@ import argparse
 from transformers import AutoTokenizer, get_scheduler
 from accelerate import Accelerator
 from dataset import StepsDataset
-from models import AutoEncoderModel
+from models import AutoRegressiveModel
 from train import train
 from collate import collate_fn
 
@@ -111,7 +111,7 @@ def main():
     
     if args.complete_model_path:
         # Load the complete model from the provided path
-        model = AutoEncoderModel.load_model(
+        model = AutoRegressiveModel.load_model(
             args.complete_model_path, 
             tokenizer=tokenizer, 
             task=args.task, 
@@ -120,7 +120,7 @@ def main():
         )
     else:
         # Load model components separately as before
-        model = AutoEncoderModel(
+        model = AutoRegressiveModel(
             tokenizer, args.encoder_path, args.latent_model_path, args.decoder_path, 
             args.task, args.freeze, args.share_param, args.use_cont
         )

@@ -17,7 +17,7 @@ The framework uses a decoder-only Transformer (GPT-2) with shared parameters for
 The embedding is then used to condition the decoder, which is trained autoregressively with cross-entropy loss to reconstruct the original input.
 
 ## Run
-
+    
 Example usage:
 ```bash
 # Simply run in this directory:

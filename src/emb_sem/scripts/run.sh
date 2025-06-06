@@ -1,53 +1,32 @@
 #!/bin/bash
-#=============================================================================
-# Semantic Embedding Training Script
-#=============================================================================
 
-# Environment settings
+# Set environment variables
 export TOKENIZERS_PARALLELISM=false
 
-#=============================================================================
-# Data paths
-#=============================================================================
+# Define argument variables
 TRAIN_FILE="../../../data/gsm8k/train.json"
 VALID_FILE="../../../data/gsm8k/valid.json"
 TEST_FILE="../../../data/gsm8k/test.json"
 
-#=============================================================================
-# Model configuration
-#=============================================================================
-# SET THESE TO YOUR MODEL PATHS
 ENCODER_MODEL="SFT_MODEL_PATH"
 DECODER_MODEL="SFT_MODEL_PATH"
 TOKENIZER_MODEL="gpt2"
 
-# Model sharing parameters
 SHARE_PARAM="True"
 
-#=============================================================================
-# Training hyperparameters
-#=============================================================================
 BATCH_SIZE=256
 NUM_EPOCHS=3
 LEARNING_RATE="5e-4"
 MAX_LENGTH=512
 NUM_WORKERS=1
 
-#=============================================================================
-# Experiment tracking
-#=============================================================================
 PROJ_NAME="PROJ_NAME"
 EXP_NAME="EXP_NAME"
 SAVE_DIR="SAVE_DIR"
-WANDB_KEY="YOUR_WANDB_API_KEY"
-WANDB_ENTITY="YOUR_WANDB_ENTITY"
 
-# Create save directory
 mkdir -p $SAVE_DIR
 
-#=============================================================================
-# Launch training
-#=============================================================================
+# Launch the training script using accelerate
 accelerate launch --config_file acc_config.yaml ../main.py \
   --train_file "$TRAIN_FILE" \
   --valid_file "$VALID_FILE" \
@@ -63,6 +42,4 @@ accelerate launch --config_file acc_config.yaml ../main.py \
   --proj_name "$PROJ_NAME" \
   --exp_name "$EXP_NAME" \
   --save_dir "$SAVE_DIR" \
-  --share_param "$SHARE_PARAM" \
-  --wandb_key "$WANDB_KEY" \
-  --wandb_entity "$WANDB_ENTITY"
+  --share_param "$SHARE_PARAM"
