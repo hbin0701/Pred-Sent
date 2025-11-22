@@ -25,10 +25,10 @@ class StepsDataset(torch.utils.data.Dataset):
             if 'fw-edu' in file_path:
                 mode = file_path.split("/")[-1].replace(".json", "")
                 self.data = load_dataset("hbin0701/fw-edu")[mode]
+                import pdb; pdb.set_trace()
             else:
                 with open(file_path, "r") as f:
                     self.data = json.load(f)
-                
             self.processed_data = []
             for sample in tqdm(self.data):
                 if not len([x.strip() for x in sample['steps'] if x.strip()]) > 0:
@@ -37,10 +37,14 @@ class StepsDataset(torch.utils.data.Dataset):
                 # Optionally use question/answer fields if needed
                 steps = sample["steps"]
 
-                steps = [x.strip() + "\n" for x in steps]
+                steps = [x.strip() + "<|new_line|>" for x in steps]
                 for idx, step in enumerate(steps):
                     encoder_text = step
                     decoder_text = step.strip()
+
+                    # Append EOS token so the model learns a clear termination
+                    # if self.tokenizer.eos_token is not None:
+                    #     decoder_text = decoder_text + self.tokenizer.eos_token
 
                     encoder_encoding = self.tokenizer(
                         encoder_text,
@@ -52,6 +56,12 @@ class StepsDataset(torch.utils.data.Dataset):
                         truncation=True,
                         max_length=self.max_length,
                     )
+
+                    import pdb; pdb.set_trace()
+
+                    if len(decoder_encoding["input_ids"]) > 64:
+                        continue
+
                     self.processed_data.append({
                         "encoder_input_ids": encoder_encoding["input_ids"],
                         "encoder_attention_mask": encoder_encoding["attention_mask"],
@@ -62,6 +72,7 @@ class StepsDataset(torch.utils.data.Dataset):
 
             with open(cache_file, "wb") as f:
                 pickle.dump(self.processed_data, f)
+
             print(f"Processed dataset saved to {cache_file}")
 
     def __len__(self):

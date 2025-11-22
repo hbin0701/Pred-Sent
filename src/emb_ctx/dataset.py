@@ -17,7 +17,7 @@ class ContrastiveStepDataset(torch.utils.data.Dataset):
 
         cache_file = os.path.join(cache_dir, os.path.basename(file_path) + f".contrastive_step_cache_{max_length}.pkl")
 
-        if os.path.exists(cache_file):
+        if False:
             print(f"Loading cached dataset from {cache_file}")
             with open(cache_file, "rb") as f:
                 self.processed_data = pickle.load(f)
@@ -38,6 +38,7 @@ class ContrastiveStepDataset(torch.utils.data.Dataset):
                     sample['steps'].append("### " + sample['answer'])
                     
                 steps = [x.strip() for x in sample["steps"] if x.strip()]
+
                 question = sample.get("question", "")  # Get question if available
                 
                 # Process each step for contrastive learning
@@ -46,7 +47,7 @@ class ContrastiveStepDataset(torch.utils.data.Dataset):
                     
                     # Variation 1:
                     encoder_encoding1 = self.tokenizer(
-                        steps[N].strip() + "\n",
+                        steps[N].strip() + "<|new_line|>",
                         truncation=True,
                         max_length=self.max_length,
                     )
@@ -58,8 +59,8 @@ class ContrastiveStepDataset(torch.utils.data.Dataset):
                     )
 
                     # Model 2: Prediction - encoder_input_ids2 and decoder_input_ids2
-                    context2 = (question + "\n" + "\n".join(steps[:N])).strip() + "\n"
-                    target2 = steps[N].strip() + "\n"
+                    context2 = (question.strip() + "<|new_line|>" + "<|new_line|>".join(steps[:N])).strip() + "<|new_line|>"
+                    target2 = steps[N].strip() + "<|new_line|>"
                     
                     encoder_encoding2 = self.tokenizer(
                         context2,
@@ -72,6 +73,9 @@ class ContrastiveStepDataset(torch.utils.data.Dataset):
                         truncation=True,
                         max_length=self.max_length,
                     )
+
+                    if len(encoder_encoding2["input_ids"]) > 128 or len(decoder_encoding2["input_ids"]) > 64:
+                        continue
                     
                     # remove bos token for encoder_input_ids1 & encoder_input_ids2
 

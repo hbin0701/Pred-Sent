@@ -73,17 +73,31 @@ def extract_final_answer(text, task):
     if task in ["gsm8k"]:
         try:
                 ridx = text.rindex(">>")
-                return text[ridx + len(">>\n"):].split("\n")[0].strip()
+                return text[ridx + len(">><|new_line|>"):].split("<|new_line|>")[0].strip()
         except:
             # print("Not found", text)
             return text
-        
+    elif task == "csqa":
+        # Find the last occurrence of ">><|new_line|>"
+        marker = "###"
+        idx = text.find(marker)
+
+        if idx == -1:
+            return ""        
+            
+        try:
+            return text[idx:].split("<|new_line|>")[0].replace("###", "").strip()[0]
+        except:
+            return ""
     else:
         idx = text.find("###")
         if idx == -1:
             return -1
-        ans = text[idx:].split("\n")[0].replace("###", "").strip()
 
+        try:
+            ans = text[idx:].split("<|new_line|>")[0].replace("###", "").strip()
+        except:
+            return -1
         # if random.random() < 0.2:
         #     print("Answer", ans)
 

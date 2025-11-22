@@ -1,5 +1,6 @@
 # Python bytecode files
 __pycache__/
+__pyccache__/
 *.py[cod]
 *$py.class
 
@@ -21,3 +22,15 @@ env/
 
 # Logs
 *.log 
+logs/
+
+# Experiment artifacts
+wandb/
+visualizations/
+checkpoints/
+src/autoreg_ctx/scripts/checkpoints_re/
+models/
+*.ckpt
+*.png
+*.jsonl
+*.pkl

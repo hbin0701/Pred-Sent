@@ -39,6 +39,7 @@ def main():
     parser.add_argument("--wandb_entity", type=str, default=None, help="WandB entity name")
 
     parser.add_argument("--share_param", type=bool, default=False) # whether for encoder and decoder to share parameters.
+    parser.add_argument("--use_lora", type=bool, default=False) # apply LoRA adapters to encoder
 
     args = parser.parse_args()
 
@@ -46,21 +47,23 @@ def main():
     device = accelerator.device
 
     if accelerator.is_main_process:
-        if args.wandb_key:
-            wandb.login(key=args.wandb_key)
-            wandb.init(
-                project=args.proj_name, 
-                entity=args.wandb_entity, 
-                name=args.exp_name, 
-                config=vars(args)
-            )
+        wandb.init(
+            project=args.proj_name, 
+            name=args.exp_name, 
+            config=vars(args)
+        ) 
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_model_name)
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({"pad_token": tokenizer.eos_token})
+    # Ensure our custom newline token exists as a single token
+    special_tokens = tokenizer.special_tokens_map_extended.get("additional_special_tokens", [])
+    if "<|new_line|>" not in special_tokens:
+        tokenizer.add_special_tokens({"additional_special_tokens": ["<|new_line|>"]})
 
-    model = AutoEncoderModel(tokenizer, args.encoder_model_name, args.decoder_model_name, args.share_param)
+    model = AutoEncoderModel(tokenizer, args.encoder_model_name, args.decoder_model_name, args.share_param, args.use_lora)
     model.to(device)
+    model.to(torch.bfloat16)
 
     # Create datasets.
     train_dataset = StepsDataset(args.train_file, tokenizer, max_length=args.max_length)

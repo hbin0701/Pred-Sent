@@ -24,7 +24,7 @@ def train(args, model, dataset_train, eval_dataloader, test_dataloader, optimize
     model.train()
     if accelerator.is_main_process:
         if args.wandb_key:
-            wandb.login(key=args.wandb_key)
+            wandb.login(key="49e3bf1d97a7148ae772622876fd9ac8b08ce60e", relogin=True)
             wandb.init(
                 project=args.proj_name, 
                 entity=args.wandb_entity, 
@@ -35,14 +35,15 @@ def train(args, model, dataset_train, eval_dataloader, test_dataloader, optimize
     os.makedirs(save_dir, exist_ok=True)
     step = 0
 
+    test_dataset = test_dataloader.dataset if hasattr(test_dataloader, "dataset") else test_dataloader
+
     for epoch in range(num_epochs):
-        total_loss_val, total_ce, total_cont = 0.0, 0.0, 0.0
+        total_loss_val, total_primary, total_ce, total_kl, total_cont = 0.0, 0.0, 0.0, 0.0, 0.0
         dataset_train.processed_data = dataset_train.processed_data.shuffle(seed=epoch)
         train_dataloader = DataLoader(dataset_train, batch_size=args.batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x, model.tokenizer))
         train_dataloader = accelerator.prepare(train_dataloader)
 
         for idx, batch in tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoch {epoch+1}/{num_epochs}", dynamic_ncols=True, leave=True):
-            
             encoder_input_ids = batch["encoder_input_ids"].to(device)            
             encoder_attention_mask = batch["encoder_attention_mask"].to(device)
             steps_tokens = batch["steps_input_ids"].to(device)
@@ -52,7 +53,9 @@ def train(args, model, dataset_train, eval_dataloader, test_dataloader, optimize
             optimizer.zero_grad()
             loss_dict = model(encoder_input_ids, encoder_attention_mask, steps_tokens, steps_attention_mask, steps_valid_mask, accelerator)
             total_loss = loss_dict["total_loss"]
-            ce_loss = loss_dict["ce_loss"]
+            primary_loss = loss_dict.get("primary_loss", total_loss)
+            ce_loss = loss_dict.get("ce_loss", torch.tensor(0.0, device=device))
+            kl_loss = loss_dict.get("kl_loss", torch.tensor(0.0, device=device))
             cont_loss = loss_dict["cont_loss"]
 
             accelerator.backward(total_loss)
@@ -63,7 +66,9 @@ def train(args, model, dataset_train, eval_dataloader, test_dataloader, optimize
             torch.cuda.empty_cache()
 
             total_loss_val += total_loss.item()
+            total_primary += primary_loss.item()
             total_ce += ce_loss.item()
+            total_kl += kl_loss.item()
             total_cont += cont_loss.item()
             step += 1
 
@@ -72,36 +77,48 @@ def train(args, model, dataset_train, eval_dataloader, test_dataloader, optimize
             
             if accelerator.is_main_process:
                 wandb.log({
-                    "train/step_loss": total_loss.item(), 
-                    "train/ce_loss": ce_loss.item(), 
+                    "train/step_loss": total_loss.item(),
+                    "train/primary_loss": primary_loss.item(),
+                    "train/ce_loss": ce_loss.item(),
+                    "train/kl_loss": kl_loss.item(),
                     "train/cont_loss": cont_loss.item(),
                 })
 
         avg_loss = total_loss_val / len(train_dataloader)
+        avg_primary = total_primary / len(train_dataloader)
         avg_ce = total_ce / len(train_dataloader)
+        avg_kl = total_kl / len(train_dataloader)
         avg_cont = total_cont / len(train_dataloader)
         
         if accelerator.is_main_process:
             wandb.log({
                 "train/epoch_loss": avg_loss,  
+                "train/epoch_primary_loss": avg_primary,
                 "train/epoch_ce_loss": avg_ce, 
+                "train/epoch_kl_loss": avg_kl,
                 "train/epoch_cont_loss": avg_cont
             })
 
-        if (epoch + 1) % 10 == 0:
+        EPOCH_SAVE_INTERVAL = 2
+        if (epoch + 1) % EPOCH_SAVE_INTERVAL == 0:
             if accelerator.is_main_process:
                 # Save
-                if (epoch + 1) % 10 == 0:
-                    save_path = os.path.join(save_dir, f"epoch_{epoch+1}")
+                EPOCH_SAVE_INTERVAL = 4
+                if (epoch + 1) % EPOCH_SAVE_INTERVAL == 0:
+                    save_path = os.path.join(save_dir, f"epoch_{epoch+1}")  
                     model.save_model(save_path)
                     print(f"Saved checkpoint at epoch {epoch+1}")
+            
+            # accelerator.wait_for_everyone()
             
             # Create eval and test dataloaders with distributed samplers for evaluatio            
             # Run evaluation on test dataset
             
-            new_train_dataloader = make_new_dataloader(dataset_train, model.tokenizer, args, eval_accelerator)
-            test_dataloader = make_new_dataloader(test_dataloader.dataset, model.tokenizer, args, eval_accelerator)
-
+            import copy
+            new_dataset_train  = copy.deepcopy(dataset_train)
+            new_dataset_train.processed_data = new_dataset_train.processed_data.select(range(512))
+            new_train_dataloader = make_new_dataloader(new_dataset_train, model.tokenizer, args, eval_accelerator)
+            test_eval_dataloader = make_new_dataloader(test_dataset, model.tokenizer, args, eval_accelerator)
             # eval_metrics = evaluate(model, test_dataloader, device, accelerator)
             
             # Run evaluation on eval dataset
@@ -121,8 +138,12 @@ def train(args, model, dataset_train, eval_dataloader, test_dataloader, optimize
             #     print(f"Epoch {epoch+1} - Train Loss: {avg_loss:.6f} | Eval Loss: {eval_loss:.6f}")
                 
             # Use the wrapped model for test metrics calculation as requested
-            # test(model, new_train_dataloader, device, accelerator, step, mode="train")
-            test(model, test_dataloader, device, accelerator, step, mode="test")
+            test(model, new_train_dataloader, device, accelerator, step, mode="train")
+            test(model, test_eval_dataloader, device, accelerator, step, mode="test")
+            model.train()
+
+            del new_train_dataloader
+            del test_eval_dataloader
 
             import gc; gc.collect()
             torch.cuda.empty_cache()
@@ -147,7 +168,7 @@ def test(model, dataloader, device, accelerator, step, mode="train", MAX_SAMPLES
     
     # Process batches distributed across GPUs
     for idx, batch in tqdm(enumerate(dataloader), desc="Testing", leave=False):
-
+        
         if mode == "train" and idx > 5:
             break
         
@@ -206,14 +227,21 @@ def test(model, dataloader, device, accelerator, step, mode="train", MAX_SAMPLES
                 f"{mode}_acc/disc/overall": overall_disc_acc,
                 f"{mode}_acc/disc/pos": overall_disc_pos_acc,
             }
+
+            
         else:
             log_dict = {
                 f"{mode}_acc/cont/overall": overall_cont, 
                 f"{mode}_acc/cont/pos": overall_cont_pos,
+                f"{mode}_acc/disc/overall": overall_disc_acc,
             }
 
         # Log everything with wandb:
         wandb.log(log_dict)
+
+        import jsonlines
+        with jsonlines.open(f"{mode}_metrics.jsonl", mode="a") as writer:
+            writer.write(log_dict)
         
         # Save metrics to a jsonl file
         metrics_to_save = {
@@ -229,13 +257,17 @@ def test(model, dataloader, device, accelerator, step, mode="train", MAX_SAMPLES
             }
         }
         
-        return log_dict
+    accelerator.wait_for_everyone()
+    print("TESTING COMPLETED")
+
     return {}
 
 def evaluate(model, eval_dataloader, device, accelerator):
     model.eval()
     total_eval_loss = 0.0
+    total_eval_primary_loss = 0.0
     total_eval_ce_loss = 0.0
+    total_eval_kl_loss = 0.0
     total_eval_cont_loss = 0.0
     n_batches = 0
     
@@ -251,14 +283,18 @@ def evaluate(model, eval_dataloader, device, accelerator):
 
             loss_dict = model(encoder_input_ids, encoder_attention_mask, steps_tokens, steps_attention_mask, steps_valid_mask, accelerator)
             total_eval_loss += loss_dict["total_loss"].item()
-            total_eval_ce_loss += loss_dict["ce_loss"].item()
+            total_eval_primary_loss += loss_dict.get("primary_loss", loss_dict["total_loss"]).item()
+            total_eval_ce_loss += loss_dict.get("ce_loss", torch.tensor(0.0, device=device)).item()
+            total_eval_kl_loss += loss_dict.get("kl_loss", torch.tensor(0.0, device=device)).item()
             total_eval_cont_loss += loss_dict["cont_loss"].item()
             n_batches += 1
 
     # Gather results from all processes
     all_losses = [
         torch.tensor([total_eval_loss], device=device),
+        torch.tensor([total_eval_primary_loss], device=device),
         torch.tensor([total_eval_ce_loss], device=device),
+        torch.tensor([total_eval_kl_loss], device=device),
         torch.tensor([total_eval_cont_loss], device=device),
         torch.tensor([n_batches], device=device)
     ]
@@ -266,12 +302,14 @@ def evaluate(model, eval_dataloader, device, accelerator):
     for i in range(len(all_losses)):
         all_losses[i] = accelerator.gather(all_losses[i]).sum()
     
-    gathered_total_eval_loss, gathered_total_eval_ce_loss, gathered_total_eval_cont_loss, \
+    gathered_total_eval_loss, gathered_total_eval_primary_loss, gathered_total_eval_ce_loss, gathered_total_eval_kl_loss, gathered_total_eval_cont_loss, \
     gathered_n_batches = [t.item() for t in all_losses]
 
     # Compute average losses
     avg_total_loss = gathered_total_eval_loss / gathered_n_batches
+    avg_primary_loss = gathered_total_eval_primary_loss / gathered_n_batches
     avg_ce_loss = gathered_total_eval_ce_loss / gathered_n_batches
+    avg_kl_loss = gathered_total_eval_kl_loss / gathered_n_batches
     avg_cont_loss = gathered_total_eval_cont_loss / gathered_n_batches
 
     model.train()
@@ -279,12 +317,16 @@ def evaluate(model, eval_dataloader, device, accelerator):
     if accelerator.is_main_process:
         wandb.log({
             "eval/total_loss": avg_total_loss,
+            "eval/primary_loss": avg_primary_loss,
             "eval/ce_loss": avg_ce_loss,
+            "eval/kl_loss": avg_kl_loss,
             "eval/cont_loss": avg_cont_loss,
         })
 
     return {
         "total_loss": avg_total_loss,
+        "primary_loss": avg_primary_loss,
         "ce_loss": avg_ce_loss,
+        "kl_loss": avg_kl_loss,
         "cont_loss": avg_cont_loss,
     }

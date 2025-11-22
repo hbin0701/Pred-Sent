@@ -90,6 +90,8 @@ def train_batch(batch, components, device, global_step):
     decoder_input_ids2 = batch["decoder_input_ids2"].to(device)
     decoder_attention_mask2 = batch["decoder_attention_mask2"].to(device)
     
+    print("ENCODER ID SHAPE", encoder_input_ids2.shape, "|", "DECODER ID SHAPE", decoder_input_ids2.shape)
+    
     prediction_loss, _, prediction_loss_dict = model2(
         encoder_input_ids2, 
         encoder_attention_mask2, 
@@ -553,6 +555,9 @@ def train_contrastive(args, accelerators, models, optimizers, device, lr_schedul
             
             # Skip training if there's a break statement here
             # Process batch
+            # if batch['encoder_input_ids2'].shape[1] + batch['decoder_input_ids2'].shape[1] > 200:
+            #     continue  # prevent OOM.
+            
             batch_results = train_batch(batch, components, device, global_step)
             
             # Track losses

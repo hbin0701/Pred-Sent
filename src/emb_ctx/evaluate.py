@@ -12,7 +12,7 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 # def extract_answer(generated_steps):
 #     """
-#     Extract the final answer from generated steps using ">>\n" as a marker.
+#     Extract the final answer from generated steps using ">><|new_line|>" as a marker.
     
 #     Args:
 #         generated_steps: List of strings, each representing a generated step
@@ -21,10 +21,10 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 #         The extracted answer or empty string if no answer marker found
 #     """
 #     # Combine all generated steps into a single string
-#     full_text = "\n".join(generated_steps)
+#     full_text = "<|new_line|>".join(generated_steps)
     
-#     # Find the last occurrence of ">>\n"
-#     marker = ">>\n"
+#     # Find the last occurrence of ">><|new_line|>"
+#     marker = ">><|new_line|>"
 #     idx = full_text.rfind(marker)
     
 #     if idx == -1:
@@ -35,30 +35,30 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 #     remaining_text = full_text[answer_start:]
     
 #     # Get the first line (up to the next newline or end of string)
-#     lines = remaining_text.split("\n")
+#     lines = remaining_text.split("<|new_line|>")
 #     if not lines:
 #         return ""
         
 #     return lines[0].strip()
 
 def extract_answer(generated_steps, task):
-    full_text = "\n".join(generated_steps)
+    full_text = "<|new_line|>".join(generated_steps)
     
     if task == "csqa":
-        # Find the last occurrence of ">>\n"
+        # Find the last occurrence of ">><|new_line|>"
         marker = "###"
         idx = full_text.find(marker)
 
         if idx == -1:
             return ""
         
-        return full_text[idx:].split("\n")[0].replace("###", "").strip()
+        return full_text[idx:].split("<|new_line|>")[0].replace("###", "").strip()[0]
     
     elif task == "gsm8k":
         
         try:
             target = [x for x in generated_steps if ">>" not in x][0]
-            return target.split("\n")[0].strip()
+            return target.split("<|new_line|>")[0].strip()
         except:
             return generated_steps[-1]
         
@@ -161,10 +161,10 @@ def create_html_visualization(sample_data, mode, step):
         
         # Format the steps with step numbers
         steps_text = ""
-        steps = sample["Generated Steps"].split("\n")
+        steps = sample["Generated Steps"].split("<|new_line|>")
         for j, step_text in enumerate(steps):
             if step_text.strip():
-                steps_text += f"<span class='step-number'>Step {j+1}:</span> {step_text}\n"
+                steps_text += f"<span class='step-number'>Step {j+1}:</span> {step_text}<|new_line|>"
         
         html += f"""
                 <div class="sample">
@@ -291,7 +291,7 @@ def update_html_visualization(new_sample_data, mode, step):
     # Add toggle buttons for each timestamp, sorted by step number
     sorted_steps = sorted(_sample_history[mode].keys())
     for history_step in sorted_steps:
-        html += f'<button id="btn-{history_step}" class="toggle-btn" onclick="showTimestamp({history_step})">Step {history_step}</button>\n'
+        html += f'<button id="btn-{history_step}" class="toggle-btn" onclick="showTimestamp({history_step})">Step {history_step}</button><|new_line|>'
     
     html += """
             </div>
@@ -324,10 +324,10 @@ def update_html_visualization(new_sample_data, mode, step):
             
             # Format the steps with step numbers
             steps_text = ""
-            steps = sample["Generated Steps"].split("\n")
+            steps = sample["Generated Steps"].split("<|new_line|>")
             for j, step_text in enumerate(steps):
                 if step_text.strip():
-                    steps_text += f"<span class='step-number'>Step {j+1}:</span> {step_text}\n"
+                    steps_text += f"<span class='step-number'>Step {j+1}:</span> {step_text}<|new_line|>"
             
             html += f"""
                 <div class="sample">
@@ -382,11 +382,12 @@ def generate_step(model, contexts, device):
         decoder = model.decoder
             
         # Get encoder outputs
-        encoder_outputs = encoder.transformer(
+        encoder_outputs = encoder.model(
             encoded_contexts.input_ids, 
-            attention_mask=encoded_contexts.attention_mask
+            attention_mask=encoded_contexts.attention_mask,
+            output_hidden_states=True
         )
-        encoder_hidden_states = encoder_outputs.last_hidden_state
+        encoder_hidden_states = encoder_outputs.hidden_states[-1]
         
         # Get the last token representation
         last_token_indices = encoded_contexts.attention_mask.sum(dim=1) - 1
@@ -426,12 +427,12 @@ def log_generation(contexts, generated_texts, questions, batch_idx, step, mode):
                 "mode": mode,
                 "batch_idx": batch_idx,
                 "sample_idx": i,
-                "generation_idx": contexts[i].count('\n'),  # Approximate step count
+                "generation_idx": contexts[i].count('<|new_line|>'),  # Approximate step count
                 "question": questions[i],
                 "current_context": contexts[i],
                 "generated_text": generated_text
             }
-            f.write(json.dumps(log_entry) + "\n")
+            f.write(json.dumps(log_entry) + "<|new_line|>")
 
 def evaluate_problem_solving(model, problem_dataloader, device, accelerator, step, mode, num_generations, max_samples=1500):
     """Evaluate problem-solving capabilities of the prediction model."""
@@ -455,7 +456,7 @@ def evaluate_problem_solving(model, problem_dataloader, device, accelerator, ste
         total_problems += batch_size
         
         # Initialize contexts with questions for all samples in batch
-        contexts = [q + "\n" for q in questions]
+        contexts = [q + "<|new_line|>" for q in questions]
         all_generated_steps = [[] for _ in range(batch_size)]
         
         # Iterative generation for the entire batch
@@ -466,7 +467,7 @@ def evaluate_problem_solving(model, problem_dataloader, device, accelerator, ste
                 # Update contexts and store generated steps
                 for i, text in enumerate(generated_texts):
                     all_generated_steps[i].append(text)
-                    contexts[i] += text.strip() + "\n"
+                    contexts[i] += text.strip()
                 
                 # Log generations
                 log_generation(contexts, generated_texts, questions, batch_idx, step, mode)
@@ -491,7 +492,7 @@ def evaluate_problem_solving(model, problem_dataloader, device, accelerator, ste
                 if batch_idx < 5:  # Only collect samples from first few batches
                     sample_data.append({
                         "Question": questions[i],
-                        "Generated Steps": "\n".join(all_generated_steps[i]),
+                        "Generated Steps": "<|new_line|>".join(all_generated_steps[i]),
                         "Extracted Answer": predicted_answer,
                         "Ground Truth": ground_truth,
                         "Correct": is_correct

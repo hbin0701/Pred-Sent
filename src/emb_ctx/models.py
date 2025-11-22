@@ -60,7 +60,7 @@ class ContrastiveStepPredictor(nn.Module):
     
     The contrastive functionality compares representations between the two models.
     """
-    def __init__(self, tokenizer, encoder_model_name, decoder_model_name, share_param=False, task=None):
+    def __init__(self, tokenizer, encoder_model_name, decoder_model_name, share_param=False, task=None, use_lora=True, update=True):
         """
         Initialize the model predictor.
         
@@ -71,22 +71,41 @@ class ContrastiveStepPredictor(nn.Module):
             share_param: Whether to share parameters between encoder and decoder
         """
         super().__init__()
-        self.tokenizer = tokenizer
+        self.tokenizer = tokenizer 
         
         # Single encoder-decoder pair
         self.encoder = AutoModelForCausalLM.from_pretrained(encoder_model_name)
-
-        # encoder_lora_config = LoraConfig(
-        #         r=256,
-        #         lora_alpha=1024,
-        #         lora_dropout=0.1,
-        #         bias="none",
-        #         task_type="CAUSAL_LM"
-        #     )
         
-        # self.encoder = get_peft_model(self.encoder, encoder_lora_config)
+        target_tok = tokenizer.encode("<|new_line|>")[0]
+        src_tok = tokenizer.encode("\n")[0]
+        self.encoder.model.embed_tokens.weight.data[target_tok] = self.encoder.model.embed_tokens.weight.data[src_tok].clone()
+        self.encoder.lm_head.weight.data[target_tok] = self.encoder.lm_head.weight.data[src_tok].clone()
+
+
+        target_tok = tokenizer.encode("<|new_line|>")[0]
+        src_tok = tokenizer.encode("\n")[0]
+        self.encoder.model.embed_tokens.weight.data[target_tok] = self.encoder.model.embed_tokens.weight.data[src_tok].clone()
+        self.encoder.lm_head.weight.data[target_tok] = self.encoder.lm_head.weight.data[src_tok].clone()
+        
+        self.use_lora = use_lora
+        self.update = update
+    
+        if use_lora:
+            print("Using Lora...")
+            encoder_lora_config = LoraConfig(
+                    r=1024,
+                    lora_alpha=2048,
+                    lora_dropout=0.1,
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                    bias="none",
+                    task_type="CAUSAL_LM"
+                )
+            
+            self.encoder = get_peft_model(self.encoder, encoder_lora_config)
+
         self.decoder = self.encoder if share_param else AutoModelForCausalLM.from_pretrained(decoder_model_name)
 
+        # Enable gradient checkpointing to trade compute for memory
         # Set pad token if not defined
         self._set_pad_tokens()
         
@@ -94,6 +113,29 @@ class ContrastiveStepPredictor(nn.Module):
         self.last_encoder_rep = None
         
         self.task = task
+        
+        # Monkey-patch generate to route to custom generator when prefix embeds are provided
+        try:
+            original_encoder_generate = self.encoder.generate
+            original_decoder_generate = self.decoder.generate
+            
+            def _make_generate_wrapper(original_generate):
+                def _wrapped_generate(model_self, *args, **kwargs):
+                    # If caller provides inputs_embeds (prefix), use custom path
+                    prefix = kwargs.get("inputs_embeds", None)
+                    if prefix is not None:
+                        max_new_tokens = kwargs.get("max_new_tokens", 32)
+                        return self._custom_generate_from_prefix_with_model(
+                            model_self, prefix, max_new_tokens=max_new_tokens
+                        )
+                    # Otherwise, fall back to the original generate
+                    return original_generate(*args, **kwargs)
+                return _wrapped_generate
+            
+            self.encoder.generate = _make_generate_wrapper(original_encoder_generate).__get__(self.encoder, self.encoder.__class__)
+            self.decoder.generate = _make_generate_wrapper(original_decoder_generate).__get__(self.decoder, self.decoder.__class__)
+        except Exception as e:
+            print(f"Warning: failed to patch generate methods: {e}")
 
     def _set_pad_tokens(self):
         """Set pad tokens for all models if not already defined"""
@@ -120,10 +162,12 @@ class ContrastiveStepPredictor(nn.Module):
         device = encoder_input_ids.device
         
         # Get encoder outputs
-        encoder_outputs = self.encoder.transformer(
-            encoder_input_ids, attention_mask=encoder_attention_mask
+        encoder_outputs = self.encoder.model(
+            input_ids=encoder_input_ids,
+            attention_mask=encoder_attention_mask,
+            output_hidden_states=True,  # we only need the last hidden state
         )
-        encoder_hidden_states = encoder_outputs.last_hidden_state
+        encoder_hidden_states = encoder_outputs.hidden_states[-1]
         
         # Get representation for last token
         last_token_indices = encoder_attention_mask.sum(dim=1) - 1
@@ -137,7 +181,10 @@ class ContrastiveStepPredictor(nn.Module):
         prefix = F.dropout(prefix, p=0.2, training=self.training)
         
         # Get decoder token embeddings
-        decoder_embeds = self.decoder.transformer.wte(decoder_input_ids)
+        if self.use_lora:
+            decoder_embeds = self.decoder.model.model.embed_tokens(decoder_input_ids)
+        else:
+            decoder_embeds = self.decoder.model.embed_tokens(decoder_input_ids)
         
         # Concatenate prefix to decoder embeddings
         decoder_embeds = torch.cat([prefix, decoder_embeds], dim=1)
@@ -147,11 +194,12 @@ class ContrastiveStepPredictor(nn.Module):
         full_decoder_attention_mask = torch.cat([prefix_attention_mask, decoder_attention_mask], dim=1)
         
         # Run decoder with combined embeddings and mask
-        decoder_outputs = self.decoder.transformer(
+        decoder_outputs = self.decoder.model(
             inputs_embeds=decoder_embeds,
-            attention_mask=full_decoder_attention_mask
+            attention_mask=full_decoder_attention_mask,
+            output_hidden_states=True,  # we only need the final hidden state
         )
-        sequence_output = decoder_outputs.last_hidden_state
+        sequence_output = decoder_outputs.hidden_states[-1]
         logits = self.decoder.lm_head(sequence_output)
         
         # Align logits and labels (remove the extra time step added by prefix)
@@ -192,12 +240,98 @@ class ContrastiveStepPredictor(nn.Module):
         )
         
         # Store representation for contrastive learning
-        self.last_encoder_rep = encoder_rep
+        self.last_encoder_rep = encoder_rep.detach()
         
         return ce_loss, logits, {
-            "ce_loss": ce_loss,
+            "ce_loss": ce_loss.detach(),
             "contrastive_loss": torch.tensor(0.0, device=ce_loss.device)  # Placeholder
         }
+
+    def _custom_generate_from_prefix_with_model(self, lm, prefix, max_new_tokens=32):
+        """
+        Custom greedy generation that:
+        1) Prefills past_key_values using the given prefix embeddings
+        2) Iteratively generates tokens using past_key_values and cache_position
+        Stops on EOS or if a single token repeats excessively (degeneracy guard).
+        """
+        device = prefix.device
+        batch_size = prefix.size(0)
+        prefix_len = prefix.size(1)
+
+        eos_id = lm.config.eos_token_id
+        pad_id = lm.config.pad_token_id if lm.config.pad_token_id is not None else eos_id
+
+        # 1) Prefill using inputs_embeds to compute first-step distribution
+        prefix_attn = torch.ones((batch_size, prefix_len), dtype=torch.long, device=device)
+        prefill_out = lm(
+            inputs_embeds=prefix,
+            attention_mask=prefix_attn,
+            use_cache=True,
+            cache_position=torch.arange(0, prefix_len, device=device),
+        )
+        past_key_values = prefill_out.past_key_values
+        # Next token distribution from last position of prefix
+        logits = prefill_out.logits[:, -1, :]
+        next_token = torch.argmax(logits, dim=-1)
+
+        generated = torch.full((batch_size, max_new_tokens), fill_value=pad_id, dtype=torch.long, device=device)
+        finished = torch.zeros((batch_size,), dtype=torch.bool, device=device)
+        # Track simple repetition to avoid degenerate loops
+        repeat_run = torch.zeros((batch_size,), dtype=torch.long, device=device)
+        last_token = next_token.clone()
+
+        generated[:, 0] = next_token
+        if eos_id is not None:
+            finished = finished | (next_token == eos_id)
+
+        # 2) Iterative continuation
+        for step in range(1, max_new_tokens):
+            # For finished sequences, keep feeding eos to avoid changing the cache
+            feed_when_finished = torch.full_like(next_token, eos_id) if eos_id is not None else next_token
+            input_step = torch.where(finished, feed_when_finished, next_token).unsqueeze(1)
+
+            # Continue cache positions right after the prefix + previous steps
+            cp = torch.arange(prefix_len + step - 1, prefix_len + step, device=device)
+
+            out = lm(
+                input_ids=input_step,
+                past_key_values=past_key_values,
+                use_cache=True,
+                cache_position=cp,
+            )
+            past_key_values = out.past_key_values
+            logits = out.logits[:, -1, :]
+            next_token = torch.argmax(logits, dim=-1)
+
+            # Write tokens only for unfinished sequences
+            to_write = (~finished)
+            if to_write.any():
+                generated[to_write, step] = next_token[to_write]
+
+            # Update repetition counters
+            same_as_last = (next_token == last_token)
+            repeat_run = torch.where(same_as_last, repeat_run + 1, torch.zeros_like(repeat_run))
+            last_token = next_token
+
+            # Base EOS stop
+            if eos_id is not None:
+                finished = finished | (next_token == eos_id)
+
+            # Degeneracy guard: if same token repeats many times, stop
+            finished = finished | (repeat_run >= 10)
+
+            if torch.all(finished):
+                break
+
+        return generated
+
+    def _custom_generate_from_prefix(self, prefix, max_new_tokens=32):
+        # Backwards-compatible wrapper: use decoder by default
+        return self._custom_generate_from_prefix_with_model(self.decoder, prefix, max_new_tokens)
+
+    def generate_with_encoder(self, prefix, max_new_tokens=32):
+        # Allow generation using the encoder LM (when sharing params or for diagnostics)
+        return self._custom_generate_from_prefix_with_model(self.encoder, prefix, max_new_tokens)
 
     def test(self, encoder_input_ids, encoder_attention_mask, decoder_input_ids, decoder_attention_mask, step=None, sample_indices=None):
         """
@@ -223,10 +357,12 @@ class ContrastiveStepPredictor(nn.Module):
 
         with torch.no_grad():
             # Get encoder outputs
-            encoder_outputs = self.encoder.transformer(
-                encoder_input_ids, attention_mask=encoder_attention_mask
+            encoder_outputs = self.encoder.model(
+                input_ids=encoder_input_ids,
+                attention_mask=encoder_attention_mask,
+                output_hidden_states=True,
             )
-            encoder_hidden_states = encoder_outputs.last_hidden_state
+            encoder_hidden_states = encoder_outputs.hidden_states[-1]
             last_token_indices = encoder_attention_mask.sum(dim=1) - 1
             batch_range = torch.arange(batch_size, device=device)
             encoder_last_token_hidden_state = encoder_hidden_states[batch_range, last_token_indices]
@@ -234,16 +370,15 @@ class ContrastiveStepPredictor(nn.Module):
             # Use encoder hidden state directly without projection
             prefix_for_generation = encoder_last_token_hidden_state.unsqueeze(1)
 
-            # Generate tokens
-            generated_ids = self.decoder.generate(
-                inputs_embeds=prefix_for_generation,
-                max_new_tokens=32,
-                do_sample=False,
-                temperature=0.0
-            )
+            # Generate tokens using custom greedy loop (prefill + cache)
+            generated_ids = self._custom_generate_from_prefix(prefix_for_generation, max_new_tokens=32)
             
             # Decode generations
-            generated_texts = [self.tokenizer.decode(g, skip_special_tokens=True) for g in generated_ids]
+            try:
+                generated_texts = [self.tokenizer.decode(g, skip_special_tokens=True) for g in generated_ids]
+            except Exception as e:
+                print("ERROR", e)
+                generated_texts = ["" for g in generated_ids]
             
             # Decode ground truth
             gt_sequences = [self.tokenizer.decode(seq, skip_special_tokens=True) for seq in decoder_input_ids]

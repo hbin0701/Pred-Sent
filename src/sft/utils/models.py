@@ -87,6 +87,31 @@ def build_model(model_args: dataclass, training_args: dataclass):
     #     tokenizer.pad_token_id = tokenizer.eos_token_id
     #     model.generation_config = transformers.GenerationConfig.from_pretrained(model_args.model_name_or_path)
     #     model.generation_config.pad_token_id = model.generation_config.eos_token_id
+    
+    # Always add a dedicated newline token and initialize its embedding from '\n'
+    # 1) Add the token as an additional special token to prevent it from being split
+    added_tokens = {"additional_special_tokens": ["<|new_line|>"]}
+    num_added = tokenizer.add_special_tokens(added_tokens)
+    if num_added > 0:
+        # 2) Resize model embeddings to accommodate the new token
+        model.resize_token_embeddings(len(tokenizer))
+        # 3) Find the token ids
+        new_line_token_id = tokenizer.convert_tokens_to_ids("<|new_line|>")
+        # Try to locate a standalone '\n' token id
+        newline_token_id = tokenizer.convert_tokens_to_ids("\n")
+        if newline_token_id in (-1, tokenizer.unk_token_id, None):
+            enc = tokenizer.encode("\n", add_special_tokens=False)
+            newline_token_id = enc[0] if len(enc) == 1 else None
+        # 4) If we can find a single '\n' token id, copy embeddings
+        if newline_token_id is not None and newline_token_id not in (-1, tokenizer.unk_token_id):
+            input_embeddings = model.get_input_embeddings()
+            if input_embeddings is not None and hasattr(input_embeddings, "weight"):
+                input_embeddings.weight.data[new_line_token_id] = input_embeddings.weight.data[newline_token_id].clone()
+            output_embeddings = model.get_output_embeddings()
+            if output_embeddings is not None and hasattr(output_embeddings, "weight"):
+                output_embeddings.weight.data[new_line_token_id] = output_embeddings.weight.data[newline_token_id].clone()
+        else:
+            print("+ [Model] Warning: Could not find standalone '\\n' token id; leaving '<|new_line|>' embedding as-initialized.")
 
     return model, tokenizer
 

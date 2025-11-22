@@ -6,14 +6,33 @@ import argparse
 import json
 import re
 import jsonlines
+import csv
+import pathlib
 from fraction import Fraction
 from vllm import LLM, SamplingParams
 import sys
 from tqdm.auto import tqdm  
 # from utils_ans import extract_answer
 
+NEWLINE_TOKEN = "<|new_line|>"
+
+def normalize_newlines_for_prompt(text: str) -> str:
+    return text.replace("\n", NEWLINE_TOKEN)
+
+def denormalize_newlines_from_model(text: str) -> str:
+    return text.replace(NEWLINE_TOKEN, "\n")
+
 def extract_answer(x):
-    return x.strip().split("\n")[-1].replace("###", "").strip()
+    x = denormalize_newlines_from_model(x)
+    # Prefer explicit "### <LETTER>" pattern if present
+    m = re.search(r"###\s*([A-E])", x)
+    if m:
+        return m.group(1)
+    # Fallback: take last segment and strip markers
+    tail = x.strip().split("<|new_line|>")[-1].replace("###", "").strip()
+    # Keep only a single capital MC letter if present
+    m2 = re.search(r"\b([A-E])\b", tail)
+    return m2.group(1) if m2 else tail
 
 MAX_INT = sys.maxsize
 
@@ -48,20 +67,28 @@ def gsm8k_test(model, data_path, start=0, end=MAX_INT, batch_size=1, tensor_para
             
             if idx < len(already_done):
                 continue
-            
-            gsm8k_ins.append(elem["question"].strip() + "\n")
-            
-            if "###" not in elem['steps'][-1]:
-                gsm8k_answers.append("\n".join(elem["steps"]) + "\n### " + elem["answer"])
+            prompt_q = normalize_newlines_for_prompt(elem["question"].strip())
+            gsm8k_ins.append(prompt_q + NEWLINE_TOKEN)
+            # Build a clean gold answer string: steps followed by exactly one "<|new_line|>### <LETTER>"
+            steps_joined = NEWLINE_TOKEN.join(elem["steps"])
+            # Remove any trailing answer-like suffix already present in steps (supports both tokens)
+            steps_joined = re.sub(r'(?:<\|new_line\|>|<|new_line|>)+###\s*[A-E]\s*$', '', steps_joined)
+            raw_gold = str(elem.get("answer", "")).strip()
+            m = re.search(r"###\\s*([A-E])", raw_gold)
+            if m:
+                gold_letter = m.group(1)
             else:
-                gsm8k_answers.append("\n".join(elem["steps"]) + "\n" + elem["answer"])
+                m2 = re.search(r"\\b([A-E])\\b", raw_gold)
+                gold_letter = m2.group(1) if m2 else raw_gold[-1:]  # best-effort
+            ans = f"{steps_joined}{NEWLINE_TOKEN}### {gold_letter}"
+            gsm8k_answers.append(normalize_newlines_for_prompt(ans))
        
     gsm8k_ins = gsm8k_ins[start:end]
     gsm8k_answers = gsm8k_answers[start:end]
     print('length ====', len(gsm8k_ins))
     batch_gsm8k_ins = batch_data(gsm8k_ins, batch_size=batch_size)
 
-    # stop_tokens = ["\n\n", "Question:", "Question", "USER:", "USER", "ASSISTANT:", "ASSISTANT", "Instruction:", "Instruction", "Response:", "Response"]
+    # stop_tokens = ["<|new_line|><|new_line|>", "Question:", "Question", "USER:", "USER", "ASSISTANT:", "ASSISTANT", "Instruction:", "Instruction", "Response:", "Response"]
     stop_tokens = []
         
     if temp == 0.7:
@@ -69,7 +96,15 @@ def gsm8k_test(model, data_path, start=0, end=MAX_INT, batch_size=1, tensor_para
     else:
         n = 1
     
-    sampling_params = SamplingParams(temperature=temp, top_p=1, max_tokens=512, stop=stop_tokens, n=n)
+    sampling_params = SamplingParams(
+        temperature=temp,
+        top_p=1,
+        max_tokens=512,
+        stop=stop_tokens,
+        n=n,
+        skip_special_tokens=False,  # keep <|new_line|> in outputs
+        spaces_between_special_tokens=True
+    )
     print('sampling =====', sampling_params)
     llm = LLM(model=model,tensor_parallel_size=tensor_parallel_size, enforce_eager=False, gpu_memory_utilization=0.2)
     result = []
@@ -112,6 +147,18 @@ def gsm8k_test(model, data_path, start=0, end=MAX_INT, batch_size=1, tensor_para
         # import pdb; pdb.set_trace()
     final_acc = sum(sa) / len(sa)
     print(args.result_file, "Final Acc:", final_acc)
+    
+    # Optionally write checkpoint accuracy to CSV
+    if getattr(args, "output_csv", None):
+        csv_path = args.output_csv
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True) if os.path.dirname(csv_path) else None
+        file_exists = os.path.exists(csv_path)
+        ckpt_name = os.path.basename(os.path.normpath(args.model))
+        with open(csv_path, mode="a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["checkpoint", "accuracy"])
+            writer.writerow([ckpt_name, f"{final_acc:.6f}"])
 
 
 def parse_args():
@@ -123,7 +170,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=1000)  # batch_size
     parser.add_argument("--tensor_parallel_size", type=int, default=1)  # tensor_parallel_size
     parser.add_argument("--result_file", type=str, default="./new_csqa_large.jsonl")  # tensor_parallel_size
-    parser.add_argument("--temp", type=float, default=0.7) 
+    parser.add_argument("--temp", type=float, default=0.7)
+    parser.add_argument("--output_csv", type=str, default="")  # path to append per-checkpoint accuracy
 
     return parser.parse_args()
 
@@ -135,5 +183,13 @@ if __name__ == "__main__":
     DATA = args.data_file
     
     args = parse_args()
-    gsm8k_test(model=MODEL, data_path=DATA, start=0, end=1000000000, batch_size=args.batch_size, temp=args.temp)
+    gsm8k_test(
+        model=MODEL,
+        data_path=DATA,
+        start=args.start,
+        end=args.end,
+        batch_size=args.batch_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        temp=args.temp
+    )
     

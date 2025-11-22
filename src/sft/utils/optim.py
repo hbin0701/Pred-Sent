@@ -1,4 +1,4 @@
-from transformers import AdamW
+from torch.optim import AdamW
 from transformers import get_scheduler
 import transformers
 from typing import Optional, List, Dict, Set, Any, Union

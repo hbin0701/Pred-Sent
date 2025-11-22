@@ -21,19 +21,19 @@ class StepsDataset(Dataset):
             question = example["question"].strip()
             steps = example["steps"]
             answer = example["answer"]
-            # Ensure each step ends with a newline.
+            # Ensure each step ends with <|new_line|>
 
             if not ('gsm8k' in file_path or 'edu' in file_path):
                 if not steps[-1].startswith("###"):
                     steps.append(f"### {answer}")
                 
-            steps = [step.strip() + "\n" for step in steps if step.strip() != ""]
-            steps = steps[:20]
+            steps = [step.strip() + "<|new_line|>" for step in steps if step.strip() != ""]
+            steps = steps[:7]
 
             # Create encoder input by combining question and steps.
             
             if 'edu' not in file_path:
-                inp = question + "\n" + "".join(steps)
+                inp = question + "<|new_line|>" + "".join(steps)
             else:
                 inp = ''.join(steps)
             

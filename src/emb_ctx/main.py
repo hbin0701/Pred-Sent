@@ -133,17 +133,16 @@ def main():
     device = accelerator1.device  # Use device from first accelerator for consistency
     
     if accelerator1.is_main_process:
-        if args.wandb_key:
-            wandb.login(key=args.wandb_key)
-            wandb.init(
-                project=args.proj_name, 
-                entity=args.wandb_entity, 
-                name=args.exp_name, 
-                config=vars(args)
-            )
-
+        wandb.init(
+            project=args.proj_name, 
+            name=args.exp_name, 
+            config=vars(args)
+        )
+    from transformers import Qwen2Tokenizer
     # Set up tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_model_name)
+
+    # TOdo: might need to fix later.
+    tokenizer = Qwen2Tokenizer.from_pretrained(args.tokenizer_model_name)
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({"pad_token": tokenizer.eos_token})
 
@@ -151,12 +150,12 @@ def main():
     # Create two separate models: one for restoration and one for prediction
     model1 = ContrastiveStepPredictor(
         tokenizer, args.encoder1_model_name, args.decoder1_model_name, 
-        args.share_param, args.task
+        args.share_param, args.task, use_lora=False, update=False
     )
     
     model2 = ContrastiveStepPredictor(
         tokenizer, args.encoder2_model_name, args.decoder2_model_name, 
-        args.share_param, args.task
+        args.share_param, args.task, use_lora=True, update=True
     )
     
     # Create contrastive datasets

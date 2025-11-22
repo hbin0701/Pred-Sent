@@ -65,7 +65,7 @@ def train_stage1(args, accelerator, model, optimizer, lr_scheduler,
         if accelerator.is_main_process:
             wandb.log({"eval_loss": avg_eval_loss, "epoch": epoch + 1, "global_step": global_step})
             unwrapped_model = accelerator.unwrap_model(model)
-            # Determine checkpoint version.
+            # # Determine checkpoint version.
             new_checkpoint = f"{args.save_dir}/{epoch+1}"
             os.makedirs(new_checkpoint, exist_ok=True)
             unwrapped_model.encoder.save_pretrained(f"{new_checkpoint}/encoder", save_function=accelerator.save)

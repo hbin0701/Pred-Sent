@@ -103,6 +103,13 @@ def main():
     set_deepspeed_config(accelerator, training_args)
     model, tokenizer = build_model(model_args, training_args)
 
+    # For Qwen add this line.
+    target_tok = tokenizer.encode("<|new_line|>")[0]
+    src_tok = tokenizer.encode("\n")[0]
+
+    model.model.embed_tokens.weight.data[target_tok] = model.model.embed_tokens.weight.data[src_tok].clone()
+    model.lm_head.weight.data[target_tok] = model.lm_head.weight.data[src_tok].clone()
+
     data_module = make_finetuning_generator_data_module(tokenizer, data_args)
     train_dataloader, val_dataloader = make_training_dataloaders(data_module, training_args)
     

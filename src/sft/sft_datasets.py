@@ -37,7 +37,7 @@ def get_examples(data_dir, split, mode):
         new_elem = {}
         
         if elem['question'] != '':
-            new_elem["question"] = elem["question"].strip() + "\n"
+            new_elem["question"] = elem["question"].strip() + "<|new_line|>"
         else:
             new_elem["question"] = ''
         
@@ -45,10 +45,12 @@ def get_examples(data_dir, split, mode):
         if mode == "no_cot":
             elem['steps'] = [elem['steps'][-1]]
                 
-        if data_dir != 'fineweb-edu' or "###" in elem['steps'][-1] or "<answer>" in elem['steps'][-1]:
-            new_elem["answer"] = "\n".join(elem["steps"])      
+        # If steps already include a final answer marker, do not append another.
+        # Append "### <LETTER>" only when steps do not include it.
+        if data_dir == 'fineweb-edu' or "###" in elem['steps'][-1] or "<answer>" in elem['steps'][-1]:
+            new_elem["answer"] = "<|new_line|>".join(elem["steps"])      
         else:
-            new_elem["answer"] = "\n".join(elem["steps"]) + "\n### " + elem["answer"]
+            new_elem["answer"] = "<|new_line|>".join(elem["steps"]) + "<|new_line|>### " + elem["answer"]
      
         examples.append(new_elem)
 

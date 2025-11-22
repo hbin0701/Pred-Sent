@@ -62,6 +62,9 @@ def main():
     parser.add_argument('--freeze', action='store_true', help='Whether to freeze the encoder & translator or not.')
     parser.add_argument('--share_param', action='store_true', help='Whether for encoder & translator to share the weight or not.')
     parser.add_argument('--use_cont', action='store_true', help='Whether to use contrastive loss or not.')
+    parser.add_argument('--loss_type', type=str, default="ce", choices=["ce", "kl"], help='Primary loss to optimize.')
+    parser.add_argument('--kl_alpha', type=float, default=0.5, help='Weight for CE vs KL when loss_type=kl.')
+    parser.add_argument('--kl_temperature', type=float, default=1.0, help='Distillation temperature when loss_type=kl.')
     
     args = parser.parse_args()
     
@@ -78,6 +81,7 @@ def main():
     dataloader_config = DataLoaderConfiguration(even_batches=False) 
     eval_accelerator = Accelerator(dataloader_config=dataloader_config)
     
+    from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -112,19 +116,26 @@ def main():
     )
     
     if args.complete_model_path:
+        print("---" * 10)
+        print("Loading complete model from", args.complete_model_path)
+        print("---" * 10)
         # Load the complete model from the provided path
         model = AutoRegressiveModel.load_model(
             args.complete_model_path, 
             tokenizer=tokenizer, 
             task=args.task, 
             use_cont=args.use_cont, 
-            freeze=args.freeze
+            freeze=args.freeze,
+            loss_type=args.loss_type,
+            kl_alpha=args.kl_alpha,
+            kl_temperature=args.kl_temperature,
         )
     else:
         # Load model components separately as before
         model = AutoRegressiveModel(
             tokenizer, args.encoder_path, args.latent_model_path, args.decoder_path, 
-            args.task, args.freeze, args.share_param, args.use_cont
+            args.task, args.freeze, args.share_param, args.use_cont, args.loss_type,
+            kl_alpha=args.kl_alpha, kl_temperature=args.kl_temperature,
         )
     
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)

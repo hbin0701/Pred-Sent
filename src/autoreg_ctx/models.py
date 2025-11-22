@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2Tokenizer
 from torch.nn.utils.rnn import pad_sequence
 from utils import check_eq, extract_final_answer, compare_last_formula  # Adjust import if needed
 import random
@@ -11,8 +11,14 @@ import os
 import pickle
 from peft import PeftModel, LoraConfig, get_peft_model
 
+def _decode_custom(tokenizer, input):
+    try:
+        return tokenizer.decode(input, skip_special_tokens=True)
+    except:
+        return ""
+
 class AutoRegressiveModel(nn.Module):
-    def __init__(self, tokenizer, encoder_path, latent_model_path, decoder_path, task, freeze, share_param, use_cont):
+    def __init__(self, tokenizer, encoder_path, latent_model_path, decoder_path, task, freeze, share_param, use_cont, loss_type="ce", kl_alpha=0.5, kl_temperature=1.0):
         """
         Loads the encoder, latent model, and decoder models.
         Initializes the tokenizer from a fixed checkpoint.
@@ -21,26 +27,31 @@ class AutoRegressiveModel(nn.Module):
         """
         super().__init__()
         self.task = task
-        self.dropout_rate = 0.2 # TODO: Make this configurable
+        self.loss_type = loss_type
+        self.kl_alpha = kl_alpha
+        self.kl_temperature = kl_temperature
+        self.dropout_rate = 0.1 # TODO: Make this configurable
 
-        self.encoder = AutoModelForCausalLM.from_pretrained(encoder_path)
+        encoder_path = "/home/work/tmp_hyeonbin/pred-sent/models/trained/qwen_csqa_emb_ctx/encoder2"
+        decoder_path = "/home/work/tmp_hyeonbin/pred-sent/models/trained/qwen_csqa_emb_ctx/decoder2"
+        latent_model_path = "/home/work/tmp_hyeonbin/pred-sent/models/trained/qwen_csqa_cot/best"
+
+        self.encoder = AutoModelForCausalLM.from_pretrained(latent_model_path)
         self.latent_model = AutoModelForCausalLM.from_pretrained(latent_model_path)
-        self.decoder = AutoModelForCausalLM.from_pretrained(decoder_path)
-        
-        if 'gpt2-large' in encoder_path and 'gpt2-large' in latent_model_path and 'gpt2-large' in decoder_path:
-            lora_config = LoraConfig(
-                r=256,  
-                lora_alpha=1024,
-                target_modules=["c_attn", "c_proj"],  # 적용할 모델의 특정 레이어
-                lora_dropout=0.1,  # 드롭아웃 비율
+   
+        self.encoder = PeftModel.from_pretrained(self.encoder, encoder_path)
+        self.decoder = self.encoder
+
+        lora_config = LoraConfig(
+                r=1024,
+                lora_alpha=2048,
+                lora_dropout=0.1,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
                 bias="none",
                 task_type="CAUSAL_LM"
             )
 
-            # Encoder and Translator need SFT PATH.
-            self.encoder = PeftModel.from_pretrained("PUT_YOUR_SFT_PATH_HERE", encoder_path)
-            self.latent_model = get_peft_model(self.latent_model, lora_config)
-            self.decoder = PeftModel.from_pretrained("PUT_YOUR_SFT_PATH_HERE", decoder_path)
+        self.latent_model = get_peft_model(self.latent_model, lora_config)
  
         # Enable gradient checkpointing for memory efficiency
         self.encoder.gradient_checkpointing_enable()
@@ -66,7 +77,8 @@ class AutoRegressiveModel(nn.Module):
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Cache the newline token id.
-        self.newline_token_id = self.tokenizer.encode("\n")[0]
+        self.newline_token_id = self.tokenizer.encode("<|new_line|>")[0]
+        # Debug breakpoint removed
 
         # Set pad token IDs.
         self.encoder.config.pad_token_id = self.tokenizer.eos_token_id
@@ -75,6 +87,7 @@ class AutoRegressiveModel(nn.Module):
 
         # Define projection layers
         hidden_size = self.encoder.config.hidden_size # Assuming encoder, latent_model, decoder have same hidden size
+        self.latent_norm = nn.RMSNorm(hidden_size, eps=1e-6)
         self.encoder_to_latent_model_proj = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
@@ -93,6 +106,7 @@ class AutoRegressiveModel(nn.Module):
 
         self.encoder_to_latent_model_proj.to(torch.bfloat16)
         self.latent_model_to_decoder_proj.to(torch.bfloat16)
+        self.latent_norm.to(torch.bfloat16)
 
         self.use_cont = use_cont
         
@@ -102,7 +116,10 @@ class AutoRegressiveModel(nn.Module):
             "freeze": freeze,
             "share_param": share_param,
             "use_cont": use_cont,
-            "dropout_rate": self.dropout_rate
+            "dropout_rate": self.dropout_rate,
+            "loss_type": loss_type,
+            "kl_alpha": self.kl_alpha,
+            "kl_temperature": self.kl_temperature,
         }
 
     def build_decoder_inputs(self, batch_encoder_input_ids, valid_steps_hidden, steps_attention_mask, steps_valid_mask):
@@ -119,7 +136,7 @@ class AutoRegressiveModel(nn.Module):
         latent_targets_list = []
         attn_mask_list = []
         latent_labels_list = []
-        pointer = 0
+        step_latent_list = []
 
         for i in range(batch_size):
             enc_ids = batch_encoder_input_ids[i]
@@ -130,6 +147,9 @@ class AutoRegressiveModel(nn.Module):
             
             ## get latent embeds from valid_steps_hidden (newline_positions)            
             latent_embeds = valid_steps_hidden[i][newline_positions[:-1]].squeeze(1)
+            effective_steps = min(num_valid_steps, latent_embeds.size(0))
+            if effective_steps > 0:
+                step_latent_list.append(latent_embeds[:effective_steps])
                                                                           
             decoder_input = torch.cat([question_embeds, latent_embeds], dim=0)
             question_zeros = torch.zeros_like(question_embeds)
@@ -157,7 +177,15 @@ class AutoRegressiveModel(nn.Module):
         all_latent_targets_padded = pad_sequence(latent_targets_list, batch_first=True, padding_value=0.0)
         attn_mask_padded = pad_sequence(attn_mask_list, batch_first=True, padding_value=0)
         latent_labels_padded = pad_sequence(latent_labels_list, batch_first=True, padding_value=-1)
-        return all_latents_padded, all_latent_targets_padded, attn_mask_padded, latent_labels_padded
+        if step_latent_list:
+            flat_step_latents = torch.cat(step_latent_list, dim=0)
+        else:
+            flat_step_latents = torch.zeros(
+                (0, valid_steps_hidden.size(-1)),
+                device=device,
+                dtype=valid_steps_hidden.dtype,
+            )
+        return all_latents_padded, all_latent_targets_padded, attn_mask_padded, latent_labels_padded, flat_step_latents
 
     def pad_question(self, batch_encoder_input_ids):
         """
@@ -201,36 +229,48 @@ class AutoRegressiveModel(nn.Module):
         
         if next(self.encoder.parameters()).requires_grad == False:  # Check if encoder is frozen
             with torch.no_grad():  # Encoder is frozen
-                encoder_outputs = self.encoder.transformer(
+                encoder_outputs = self.encoder.model(
                     input_ids=encoder_input_ids,
                     attention_mask=encoder_attention_mask,
-                    return_dict=True
+                    return_dict=True,
+                    output_hidden_states=True
                 )
-                encoder_hidden_states = encoder_outputs.last_hidden_state
+                encoder_hidden_states = encoder_outputs.hidden_states[-1]
         else:  # Encoder is trainable
-            encoder_outputs = self.encoder.transformer(
+            encoder_outputs = self.encoder.model(
                 input_ids=encoder_input_ids,
                 attention_mask=encoder_attention_mask,
-                return_dict=True
+                return_dict=True,
+                output_hidden_states=True
             )
-            encoder_hidden_states = encoder_outputs.last_hidden_state
+            encoder_hidden_states = encoder_outputs.hidden_states[-1]
         
-
         # Project encoder hidden states before passing to decoder
         projected_encoder_hidden = self.encoder_to_latent_model_proj(encoder_hidden_states)
+        projected_encoder_hidden = self.latent_norm(projected_encoder_hidden)
 
+        if self.training:
+            noise_sigma = 0.5
+            noise = torch.randn_like(projected_encoder_hidden) * noise_sigma
+            projected_encoder_hidden = projected_encoder_hidden + noise
+        
         # Apply dropout AFTER projection
         projected_encoder_hidden = F.dropout(projected_encoder_hidden, p=self.dropout_rate, training=self.training)
 
-        all_latent_inputs, all_latent_targets, decoder_attention_mask, latent_ce_labels = self.build_decoder_inputs(
+        all_latent_inputs, all_latent_targets, decoder_attention_mask, latent_ce_labels, flat_step_latents = self.build_decoder_inputs(
             encoder_input_ids, projected_encoder_hidden, valid_attention, steps_valid_mask
         )
-        latent_outputs = self.latent_model.transformer(
+        latent_outputs = self.latent_model.model(
             inputs_embeds=all_latent_inputs,
-            return_dict=True # Ensure return_dict is True if accessing by name
+            return_dict=True, # Ensure return_dict is True if accessing by name
+            output_hidden_states=True
         )
+
+        # import pdb; pdb.set_trace()
+
         # last_hidden_state already has ln_f applied by the transformer model
-        latent_hidden = latent_outputs.last_hidden_state
+        latent_hidden = latent_outputs.hidden_states[-1]
+        latent_hidden = self.latent_norm(latent_hidden)
 
         # Apply dropout to decoder_hidden.
         latent_hidden_dropped = F.dropout(latent_hidden, p=self.dropout_rate, training=self.training)
@@ -247,20 +287,17 @@ class AutoRegressiveModel(nn.Module):
         valid_steps_attention_mask = steps_attention_mask[steps_valid_mask]
         
         # with torch.no_grad(): # Translator is frozen
-        if True:
-            decoder_embeds = self.decoder.transformer.wte(valid_steps_input_ids)
-            # Concatenate the *projected* decoder prefix with the *original* target token embeddings
-            decoder_embeds_combined = torch.cat([latent_prefix, decoder_embeds], dim=1)
-            decoder_attention_mask = torch.cat([torch.ones((valid_steps_attention_mask.size(0), 1), device=device, dtype=torch.long), valid_steps_attention_mask], dim=1)
+        decoder_embeds = self.decoder.model.model.embed_tokens(valid_steps_input_ids)
+        # Concatenate the *projected* decoder prefix with the *original* target token embeddings
+        decoder_embeds_combined = torch.cat([latent_prefix, decoder_embeds], dim=1)
+        decoder_attention_mask = torch.cat([torch.ones((valid_steps_attention_mask.size(0), 1), device=device, dtype=torch.long), valid_steps_attention_mask], dim=1)
 
-            # torch.cuda.empty_cache()
-
-            decoder_outputs = self.decoder(
-                inputs_embeds=decoder_embeds_combined,
-                attention_mask=decoder_attention_mask,
-                return_dict=True
-            )
-            decoder_logits = decoder_outputs.logits
+        decoder_outputs = self.decoder(
+            inputs_embeds=decoder_embeds_combined,
+            attention_mask=decoder_attention_mask,
+            return_dict=True
+        )
+        decoder_logits = decoder_outputs.logits
 
         shift_logits = decoder_logits.contiguous()
         shift_labels = valid_steps_input_ids.contiguous()
@@ -269,18 +306,39 @@ class AutoRegressiveModel(nn.Module):
         pad_token_id = self.latent_model.config.pad_token_id
         ce_mask = torch.cumsum((shift_labels == pad_token_id).to(torch.int), dim=1) <= 1
 
+        ce_mask_flat = ce_mask.view(-1)
         predictions = shift_logits.view(-1, shift_logits.size(-1))
         targets = shift_labels.view(-1)
-
-        ce_mask_flat = ce_mask.view(-1)
         loss_fct = nn.CrossEntropyLoss()
-
         ce_loss = loss_fct(predictions[ce_mask_flat], targets[ce_mask_flat])
+
+        kl_loss = torch.tensor(0.0, device=device, dtype=shift_logits.dtype)
+        if self.loss_type == "kl":
+            if flat_step_latents.size(0) != valid_steps_input_ids.size(0):
+                raise ValueError("Mismatch between collected step latents and valid decoder steps.")
+            with torch.no_grad():
+                teacher_prefix = self.latent_model_to_decoder_proj(flat_step_latents).detach().unsqueeze(1)
+                teacher_embeds_combined = torch.cat([teacher_prefix, decoder_embeds], dim=1)
+                teacher_outputs = self.decoder(
+                    inputs_embeds=teacher_embeds_combined,
+                    attention_mask=decoder_attention_mask,
+                    return_dict=True
+                )
+                teacher_logits = teacher_outputs.logits
+
+            temperature = self.kl_temperature
+            student_log_probs = F.log_softmax(shift_logits / temperature, dim=-1).view(-1, shift_logits.size(-1))[ce_mask_flat].float()
+            teacher_probs = F.softmax(teacher_logits / temperature, dim=-1).view(-1, shift_logits.size(-1))[ce_mask_flat].float()
+            kl_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature ** 2)
+            kl_loss = kl_loss.to(shift_logits.dtype)
+            primary_loss = self.kl_alpha * ce_loss + (1.0 - self.kl_alpha) * kl_loss
+        else:
+            primary_loss = ce_loss
         cont_mask = latent_ce_labels >= 0
 
         # Use original (non-dropped) latent_hidden for contrastive/MSE loss calculations if needed
         if self.use_cont and cont_mask.sum() > 0:
-            pred_latents = latent_hidden[cont_mask] # Use original latent_hidden here
+            pred_latents = latent_hidden[cont_mask] # Use normalized latent_hidden here
             target_latents = all_latent_targets[cont_mask]
 
             # normalize
@@ -299,14 +357,80 @@ class AutoRegressiveModel(nn.Module):
 
         # Add all applicable losses to the total loss
         # Note: Gradients will flow back through decoder and projection layers, but stop at encoder and translator.
-        total_loss = ce_loss + contrastive_loss
-
+        MULT_CONT = 1
+        total_loss = primary_loss + MULT_CONT * contrastive_loss
 
         return {
             "ce_loss": ce_loss,
+            "kl_loss": kl_loss,
             "cont_loss": contrastive_loss,
             "total_loss": total_loss,
+            "primary_loss": primary_loss,
         }
+
+    def _custom_generate_from_prefix_with_model(self, lm, prefix, max_new_tokens=32):
+        """
+        Greedy generation using:
+        1) Prefill with inputs_embeds to build past_key_values
+        2) Iterate with input_ids + past_key_values and cache_position
+        Stops on EOS or if a single token repeats excessively.
+        """
+        device = prefix.device
+        batch_size = prefix.size(0)
+        prefix_len = prefix.size(1)
+
+        eos_id = lm.config.eos_token_id
+        pad_id = lm.config.pad_token_id if lm.config.pad_token_id is not None else eos_id
+
+        prefix_attn = torch.ones((batch_size, prefix_len), dtype=torch.long, device=device)
+        prefill_out = lm(
+            inputs_embeds=prefix,
+            attention_mask=prefix_attn,
+            use_cache=True,
+            cache_position=torch.arange(0, prefix_len, device=device),
+        )
+        past_key_values = prefill_out.past_key_values
+        logits = prefill_out.logits[:, -1, :]
+        next_token = torch.argmax(logits, dim=-1)
+
+        generated = torch.full((batch_size, max_new_tokens), fill_value=pad_id, dtype=torch.long, device=device)
+        finished = torch.zeros((batch_size,), dtype=torch.bool, device=device)
+        repeat_run = torch.zeros((batch_size,), dtype=torch.long, device=device)
+        last_token = next_token.clone()
+
+        generated[:, 0] = next_token
+        if eos_id is not None:
+            finished = finished | (next_token == eos_id)
+
+        for step in range(1, max_new_tokens):
+            feed_when_finished = torch.full_like(next_token, eos_id) if eos_id is not None else next_token
+            input_step = torch.where(finished, feed_when_finished, next_token).unsqueeze(1)
+            cp = torch.arange(prefix_len + step - 1, prefix_len + step, device=device)
+            out = lm(
+                input_ids=input_step,
+                past_key_values=past_key_values,
+                use_cache=True,
+                cache_position=cp,
+            )
+            past_key_values = out.past_key_values
+            logits = out.logits[:, -1, :]
+            next_token = torch.argmax(logits, dim=-1)
+
+            to_write = (~finished)
+            if to_write.any():
+                generated[to_write, step] = next_token[to_write]
+
+            same_as_last = (next_token == last_token)
+            repeat_run = torch.where(same_as_last, repeat_run + 1, torch.zeros_like(repeat_run))
+            last_token = next_token
+
+            if eos_id is not None:
+                finished = finished | (next_token == eos_id)
+            finished = finished | (repeat_run >= 10)
+            if torch.all(finished):
+                break
+
+        return generated
 
     def test(
         self,
@@ -330,12 +454,16 @@ class AutoRegressiveModel(nn.Module):
         gt_labels = self._extract_ground_truth(encoder_input_ids)
         device = encoder_input_ids.device
 
-        # Part I: Measure continuous accuracy.
-        cont, cont_pos, grouped_outputs = self._measure_cont_acc(encoder_input_ids, gt_labels, device)
-
         # Part II: Measure discretized accuracy.
         disc_acc, disc_pos_acc, disc_outputs = self._measure_disc_acc(encoder_input_ids, gt_labels, device, mode=mode)
+        
+        # print("DISC: ", disc_acc, disc_pos_acc)
+        
+        # Part I: Measure continuous accuracy.
+        cont, cont_pos, cont_outputs = self._measure_cont_acc(encoder_input_ids, gt_labels, device)
 
+        # print("CONT: ", cont, cont_pos)
+        
         # Log sample predictions if in test mode.
         if mode == "test":
             if accelerator.is_main_process:
@@ -354,11 +482,20 @@ class AutoRegressiveModel(nn.Module):
         Extracts the ground truth labels from the encoder input IDs.
         Assumes the answer is the part after the first newline.
         """
+        def _decode_custom(tokenizer, input):
+            try:
+                return tokenizer.decode(input, skip_special_tokens=False)
+            except:
+                return ""
+
         gt_labels = [
-            self.tokenizer.decode(encoder_input_ids[i], skip_special_tokens=True)
+            _decode_custom(self.tokenizer, encoder_input_ids[i])
             for i in range(encoder_input_ids.size(0))
         ]
-        gt_labels = [x[x.index("\n"):] if "\n" in x else "" for x in gt_labels]
+        # gt_labels = [x[x.index("\n"):] if "\n" in x else "" for x in gt_labels]
+        gt_labels = [x[x.index("<|new_line|>"):] if "<|new_line|>" in x else "" for x in gt_labels]
+        # sep_token = '###'
+        # gt_labels = [x[x.index(sep_token)+4:x.index(sep_token)+5] if sep_token in x else "" for x in gt_labels]
         return gt_labels
 
 
@@ -369,20 +506,22 @@ class AutoRegressiveModel(nn.Module):
         """
         # Build initial decoder inputs.
         latent_inputs, latent_att_mask, latent_position_ids = self.pad_question(encoder_input_ids)
-        latent_inputs_embeds = self.latent_model.transformer.wte(latent_inputs)
+        latent_inputs_embeds = self.latent_model.model.model.embed_tokens(latent_inputs)
         N = 10
 
         # Generate latent tokens over N iterations.
         for _ in range(N):
             with torch.no_grad():
-                latent_out = self.latent_model.transformer(
+                latent_out = self.latent_model.model(
                     inputs_embeds=latent_inputs_embeds,
                     attention_mask=latent_att_mask,
                     position_ids=latent_position_ids,
+                    output_hidden_states=True,
                     return_dict=True # Use return_dict
                 )
-                # Use last_hidden_state directly, it already includes ln_f
-                latent_hidden = latent_out.last_hidden_state
+                # Use last_hidden_state directly, then normalize for stability
+                latent_hidden = latent_out.hidden_states[-1]
+                latent_hidden = self.latent_norm(latent_hidden)
                 last_hidden = latent_hidden[:, -1, :].unsqueeze(1)
                 
                 latent_inputs_embeds = torch.cat([latent_inputs_embeds, last_hidden], dim=1)
@@ -400,13 +539,11 @@ class AutoRegressiveModel(nn.Module):
         target_out_projected = self.latent_model_to_decoder_proj(target_out)
         
         with torch.no_grad():
-            final_out = self.decoder.generate(
-                inputs_embeds=target_out_projected.unsqueeze(1),
-                do_sample=False,
-                temperature=0,
+            final_out = self._custom_generate_from_prefix_with_model(
+                self.decoder, target_out_projected.unsqueeze(1), max_new_tokens=16
             )
 
-        decoded_outputs = [self.tokenizer.decode(output, skip_special_tokens=True) for output in final_out]
+        decoded_outputs = [_decode_custom(self.tokenizer, output) for output in final_out]
         grouped_outputs = [
             "".join(decoded_outputs[i : i + N]) for i in range(0, len(decoded_outputs), N)
         ]
@@ -418,11 +555,13 @@ class AutoRegressiveModel(nn.Module):
             if self.task == "gsm8k":
                 if compare_last_formula(a) == extract_final_answer(b, self.task):
                     pos_acc += 1
-            if extract_final_answer(a, self.task) == extract_final_answer(b, self.task):
+            if extract_final_answer(a, self.task) == extract_final_answer(b, self.task) and extract_final_answer(a, self.task) != -1:
                 acc += 1
-
+            
         if self.task != "gsm8k":
             pos_acc = acc
+
+        # import pdb; pdb.set_trace()
 
         return acc, pos_acc, grouped_outputs
 
@@ -433,27 +572,29 @@ class AutoRegressiveModel(nn.Module):
         """
 
         latent_inputs, latent_att_mask, latent_position_ids = self.pad_question(encoder_input_ids)
-        latent_inputs_embeds = self.latent_model.transformer.wte(latent_inputs)
+        latent_inputs_embeds = self.latent_model.model.model.embed_tokens(latent_inputs)
         N = 10
         results = ["" for _ in range(encoder_input_ids.size(0))]
         disc_acc = 0
         disc_pos_acc = 0
         
         cleaned = [ seq[mask.bool()].tolist() for seq, mask in zip(latent_inputs, latent_att_mask) ]   
-        context = self.tokenizer.batch_decode(cleaned, skip_special_tokens=True)
+        context = self.tokenizer.batch_decode(cleaned, skip_special_tokens=False)
 
         for _ in range(N):
             with torch.no_grad():
                 # 1. LM STEP
-                latent_out = self.latent_model.transformer(
+                latent_out = self.latent_model.model(
                     inputs_embeds=latent_inputs_embeds,
                     attention_mask=latent_att_mask,
                     position_ids=latent_position_ids,
-                    return_dict=True # Use return_dict
+                    return_dict=True,
+                    output_hidden_states=True
                 )
-                # Use last_hidden_state directly, it already includes ln_f
-                latent_hidden = latent_out.last_hidden_state
-                last_hidden = latent_hidden[:, -1, :].unsqueeze(1) # Unprojected latent [B, 1, H]
+                # Use last_hidden_state directly, then normalize for stability
+                latent_hidden = latent_out.hidden_states[-1]
+                latent_hidden = self.latent_norm(latent_hidden)
+                last_hidden = latent_hidden[:, -1, :].unsqueeze(1) # Normalized latent [B, 1, H]
 
                 # Update attention mask and position IDs.
                 latent_att_mask = torch.cat(
@@ -472,34 +613,32 @@ class AutoRegressiveModel(nn.Module):
                 target_out_projected = self.latent_model_to_decoder_proj(target_out_unprojected)
 
                 with torch.no_grad():
-                    decoder_out = self.decoder.generate(
-                        inputs_embeds=target_out_projected.unsqueeze(1), # Use projected
-                        max_new_tokens=128, # Add max_new_tokens
-                        do_sample=False,
-                        temperature=0,
+                    decoder_out = self._custom_generate_from_prefix_with_model(
+                        self.decoder, target_out_projected.unsqueeze(1), max_new_tokens=128
                     )
-                    decoded_outputs = [self.tokenizer.decode(output, skip_special_tokens=True) for output in decoder_out]
-                    decoded_outputs = [x.strip() + "\n" for x in decoded_outputs]         
-                    
+                    decoded_outputs = [_decode_custom(self.tokenizer, output) for output in decoder_out]
+                    decoded_outputs = [x.strip() + '<|new_line|>' for x in decoded_outputs]        
                     context = [x + y for x, y in zip(context, decoded_outputs)]
-                
+
                 # 3. ENCODER STEP (Re-encoding projected translated output)
                 enc_input_ids = self.tokenizer(
                     context, return_tensors="pt", padding=True, truncation=True
                 ).input_ids.to(device)
                 
+
                 enc_attention = self.tokenizer(
                     context, return_tensors="pt", padding=True, truncation=True
                 ).attention_mask.to(device)
 
                 with torch.no_grad(): # Encoder is frozen
-                    enc_outputs = self.encoder.transformer(
+                    enc_outputs = self.encoder.model(
                         input_ids=enc_input_ids,
                         attention_mask=enc_attention,
                         return_dict=True,
+                        output_hidden_states=True
                     )
                     # Use last_hidden_state directly, it already includes ln_f
-                    encoder_hidden_states_full = enc_outputs.last_hidden_state # [B, SeqLen, H]
+                    encoder_hidden_states_full = enc_outputs.hidden_states[-1] # [B, SeqLen, H]
 
                 
                 def get_second_last_newline_hidden_states(
@@ -508,28 +647,28 @@ class AutoRegressiveModel(nn.Module):
                     newline_token_id: int
                 ) -> torch.Tensor:
                     """
-                    Return the hidden state at the *second-to-last* newline (‘\n’) for every
+                    Return the hidden state at the *second-to-last* <|new_line|> for every
                     sample in the batch.  
-                    • If a sample contains only one newline, we fall back to that single newline.  
-                    • If a sample has no newline at all, we return an all-zero vector of the same
+                    • If a sample contains only one <|new_line|>, we fall back to that single <|new_line|>.  
+                    • If a sample has no <|new_line|> at all, we return an all-zero vector of the same
                     hidden-size (you can swap this for any default you prefer).
                     """
                     B, L = enc_input_ids.shape
                     device = enc_input_ids.device
 
-                    # Boolean mask of newline positions
+                    # Boolean mask of <|new_line|> positions
                     mask = enc_input_ids == newline_token_id               # [B, L]
 
-                    # Positions tensor: 0 … L-1, -1 where not newline
+                    # Positions tensor: 0 … L-1, -1 where not <|new_line|>
                     positions = torch.arange(L, device=device).expand(B, -1)
                     pos_masked = torch.where(mask, positions, torch.full_like(positions, -1))
 
-                    # Largest two newline positions for every sample
+                    # Largest two <|new_line|> positions for every sample
                     top2, _ = pos_masked.topk(2, dim=1)                    # [B, 2]; sorted desc
                     last_newline      = top2[:, 0]                         # always max (may be -1)
-                    second_last_nl    = top2[:, 1]                         # -1 if <2 newlines
+                    second_last_nl    = top2[:, 1]                         # -1 if <2 <|new_line|>s
 
-                    # Fall back to the only newline if there is exactly one
+                    # Fall back to the only <|new_line|> if there is exactly one
                     only_one_nl = (mask.sum(dim=1) == 1)
                     second_last_nl[only_one_nl] = last_newline[only_one_nl]
 
@@ -539,7 +678,7 @@ class AutoRegressiveModel(nn.Module):
                     # Hidden-size dimension
                     hidden_size = encoder_hidden_states_full.size(-1)
 
-                    # Where no newline at all → return zeros
+                    # Where no <|new_line|> at all → return zeros
                     no_nl = last_newline == -1
                     default_vecs = encoder_hidden_states_full.new_zeros((B, hidden_size))
 
@@ -553,8 +692,9 @@ class AutoRegressiveModel(nn.Module):
                     enc_input_ids, encoder_hidden_states_full, self.newline_token_id
                 )
                 
-                # Apply encoder-to-decoder projection
+                # Apply encoder-to-decoder projection and normalize to match training manifold
                 encoder_hidden_states_projected = self.encoder_to_latent_model_proj(encoder_hidden_states_unprojected)
+                encoder_hidden_states_projected = self.latent_norm(encoder_hidden_states_projected)
 
                 # Append projected encoder state to decoder inputs for next step
                 latent_inputs_embeds = torch.cat(
@@ -571,6 +711,7 @@ class AutoRegressiveModel(nn.Module):
                     disc_pos_acc += 1
             if extract_final_answer(a, self.task) == extract_final_answer(b, self.task):
                 disc_acc += 1
+        
         
         if self.task != "gsm8k":
             disc_pos_acc = disc_acc
@@ -591,7 +732,7 @@ class AutoRegressiveModel(nn.Module):
 
         if sample_indices:
             sampled_data = {
-                "Input": [self.tokenizer.decode(encoder_input_ids[i]) for i in sample_indices],
+                "Input": [_decode_custom(self.tokenizer, encoder_input_ids[i]) for i in sample_indices],
                 "Predictions": [predictions[i] for i in sample_indices],
                 "Ground Truth": [gt_labels[i] for i in sample_indices],
                 "Pos_Acc": [
@@ -636,6 +777,9 @@ class AutoRegressiveModel(nn.Module):
             "share_param": self.config["share_param"],
             "use_cont": self.use_cont,
             "dropout_rate": self.dropout_rate,
+            "loss_type": self.loss_type,
+             "kl_alpha": self.kl_alpha,
+             "kl_temperature": self.kl_temperature,
             "encoder_path": self.encoder.config._name_or_path,
             "latent_model_path": self.latent_model.config._name_or_path,
             "decoder_path": self.decoder.config._name_or_path if not self.config["share_param"] else None,
@@ -656,7 +800,7 @@ class AutoRegressiveModel(nn.Module):
         print(f"Model saved to {save_dir}")
         
     @classmethod
-    def load_model(cls, load_dir, tokenizer=None, task=None, use_cont=None, use_dist=None, use_mse=None, freeze=False):
+    def load_model(cls, load_dir, tokenizer=None, task=None, use_cont=None, use_dist=None, use_mse=None, freeze=False, loss_type=None):
         """
         Load a saved model from directory.
         
@@ -681,6 +825,8 @@ class AutoRegressiveModel(nn.Module):
             config["task"] = task
         if use_cont is not None:
             config["use_cont"] = use_cont
+        if loss_type is not None:
+            config["loss_type"] = loss_type
  
         # Load tokenizer if not provided
         if tokenizer is None:
@@ -696,6 +842,9 @@ class AutoRegressiveModel(nn.Module):
             freeze=freeze,
             share_param=config["share_param"],
             use_cont=config["use_cont"],
+            loss_type=config.get("loss_type", "ce"),
+            kl_alpha=config.get("kl_alpha", 0.5),
+            kl_temperature=config.get("kl_temperature", 1.0),
         )
         
         # Update dropout rate if different
